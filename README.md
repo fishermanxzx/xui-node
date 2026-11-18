@@ -10,6 +10,7 @@
 - **一个 Reality 入站**：VLESS + Reality，默认端口 443，所有用户共用。target 是 `127.0.0.1:8443`，SNI 是本机域名，入站里还没有用户。不带 Reality 认证访问这个端口，看到的是本机的真站点和真证书。
 - **面板**：端口统一 `2096`，用同一张证书走 HTTPS。3x-ui 自带的订阅服务默认也占 2096，所以会关掉。安装时会生成一个 API token，方便管理程序对接。
 - **防火墙**：用 nftables，只放行 SSH、80、443、10001（预留给 SOCKS）、2096，对所有 IP 开放，其余入站连接一律丢弃。可以不启用。
+- **SSH 不是 22 端口也不用管**：会自动识别 SSH 端口（sshd 配置、实际监听的端口、ssh.socket、当前连接）。防火墙在安装的最后一步才生效；在终端里安装时，生效后会请你新开一个 SSH 窗口确认能登录，120 秒内不确认就自动撤销。
 - **不打印密码**：面板地址、账号密码和 API token 只写进 `/etc/xui-node/result.env`（只有 root 可读），安装过程中不会打印出来。
 
 ## 准备
@@ -31,9 +32,9 @@ bash <(curl -fsSL https://raw.githubusercontent.com/fishermanxzx/xui-node/main/i
 3. Reality 端口 `[443]`
 4. SOCKS 预留端口 `[10001]`，填 0 表示不预留
 5. Xray 内核版本 `[v26.6.27]`，填 keep 表示不锁定
-6. 是否启用防火墙 `[Y]`，以及 SSH 端口
+6. 是否启用防火墙 `[Y]`，以及 SSH 端口（已自动识别好）
 
-确认后开始安装，大约需要 2 到 5 分钟。可以重复执行：已经做完的步骤会跳过，上次填的值会作为默认值。
+确认后开始安装，大约需要 2 到 5 分钟。可以重复执行：已经做完的步骤会跳过，上次选的域名、端口、Xray 版本、防火墙和 SSH 端口会作为默认值。已经装好的 Reality 入站不会被改：如果要换域名或 Reality 端口，先在面板里改好这个入站，再重新执行。
 
 如果不想交互，可以直接带参数安装，例如通过 ssh 批量装：
 
@@ -56,13 +57,18 @@ xui-node info     # 面板地址、用户名、密码、API token
 ```bash
 xui-node                # 管理菜单
 xui-node status         # 运行状态：面板、Xray 版本、证书到期时间、防火墙
-xui-node fw             # 查看防火墙规则（改端口：编辑 /etc/xui-node/firewall.conf，再执行 xui-node fw apply）
+xui-node fw             # 查看防火墙规则
+xui-node fw apply       # 重新生成防火墙规则（会重新识别 SSH 端口；改了 SSH 端口后执行一次）
 xui-node xray-pin       # 立即检查一次 Xray 版本
 xui-node update         # 更新 xui-node 脚本
 x-ui                    # 3x-ui 自带的菜单（重置账号密码等）
 ```
 
-注意：每次重新执行安装都会生成新的 API token，旧的作废。
+要额外放行别的端口：编辑 `/etc/xui-node/firewall.conf` 里的 `EXTRA_PORTS`（重新安装时会保留），再执行 `xui-node fw apply`。
+
+注意：
+- 每次重新执行安装都会生成新的 API token，旧的作废。
+- 证书续期（大约每 60 天一次）后，面板要重启才能用上新证书。重启 x-ui 会让 Xray 一起重启，在线用户会断开几秒，所以安排在续期后的下一个凌晨 4 点（按服务器时区）。
 
 ## License
 

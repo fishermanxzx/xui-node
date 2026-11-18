@@ -15,7 +15,7 @@
 set -Eeuo pipefail
 umask 022
 
-XUI_NODE_VERSION=1.0.0
+XUI_NODE_VERSION=1.0.1
 REPO=fishermanxzx/xui-node
 RAW_URL="https://raw.githubusercontent.com/${REPO}/${XUI_NODE_REF:-main}"
 
@@ -26,6 +26,7 @@ FW_CONF=$STATE_DIR/firewall.conf
 FW_RULES=$STATE_DIR/firewall.nft
 FW_TABLE=xui_node_fw
 FW_UNIT=xui-node-fw.service
+FW_REVERT=xui-node-fw-revert
 PIN_UNIT=xui-node-xray-pin
 XUI_BIN=/usr/local/x-ui/x-ui
 SITE_ROOT=/var/www/xui-node-site
@@ -39,6 +40,9 @@ DEFAULT_PANEL_PORT=2096
 DEFAULT_REALITY_PORT=443
 DEFAULT_SOCKS_PORT=10001
 DEFAULT_XRAY=v26.6.27
+# 开防火墙后等你确认 SSH 还能登录的秒数,超时自动撤销
+FW_CONFIRM_SECONDS=120
+APT=(apt-get -o DPkg::Lock::Timeout=600)
 
 # ---------------- 输出 ----------------
 if [[ -t 1 ]]; then
@@ -77,6 +81,11 @@ unit_state() {
     *) echo "未知" ;;
   esac
 }
+# 本脚本自己的路径(从文件运行时),否则是装好的管理命令
+self_path() {
+  local s=${BASH_SOURCE[0]:-}
+  if [[ -n $s && -f $s ]]; then echo "$s"; else echo "$BIN"; fi
+}
 
 random_free_port() {
   local p
@@ -110,9 +119,24 @@ load_result() {
   . "$RESULT"
 }
 
+# apt:先等 cloud-init 和系统自动更新放开锁(新开的机器常见)
+apt_install() {
+  local i
+  export DEBIAN_FRONTEND=noninteractive
+  if command -v cloud-init >/dev/null; then timeout 600 cloud-init status --wait >/dev/null 2>&1 || true; fi
+  for i in $(seq 1 20); do
+    if "${APT[@]}" update -qq; then break; fi
+    [[ $i -lt 20 ]] || die "apt-get update 一直失败"
+    warn "apt 被占用(系统可能在自动更新),15 秒后重试"
+    sleep 15
+  done
+  "${APT[@]}" install -y -qq "$@" >/dev/null
+}
+
 # ---------------- 3x-ui 接口 ----------------
-# 走本机:--resolve 把域名指到 127.0.0.1,证书照常校验(面板用的就是这个域名的证书)
+# 走本机:--resolve 把面板域名指到 127.0.0.1,证书照常校验(面板用的就是这个域名的证书)
 WORK=""
+API_HOST=""
 API_PORT=""
 WBP=""
 HDR=""
@@ -127,12 +151,17 @@ api_auth() {
   HDR=$WORK/hdr
   (umask 077; printf 'Authorization: Bearer %s\n' "$1" >"$HDR")
 }
-# api METHOD PATH [JSON]:输出 obj;success=false 或网络错误时返回非 0(错误写 stderr,不含密钥)
+# api METHOD PATH [JSON]:输出 obj;success=false 或网络错误时返回非 0(错误写 stderr,不含密钥)。
+# token 走文件、请求体走标准输入,都不出现在命令行里(ps 看不到)
 api() {
-  local method=$1 path=$2 body=${3-} out
-  local args=(-sS --max-time 180 --resolve "${DOMAIN}:${API_PORT}:127.0.0.1" -H @"$HDR" -H 'Accept: application/json' -X "$method")
-  [[ -z $body ]] || args+=(-H 'Content-Type: application/json' --data-binary "$body")
-  out=$(curl "${args[@]}" "https://${DOMAIN}:${API_PORT}/${WBP}/panel/api${path}") || { echo "请求 $path 失败" >&2; return 1; }
+  local method=$1 path=$2 body=${3-} out url
+  local args=(-sS --max-time 180 --resolve "${API_HOST}:${API_PORT}:127.0.0.1" -H @"$HDR" -H 'Accept: application/json' -X "$method")
+  url="https://${API_HOST}:${API_PORT}/${WBP}/panel/api${path}"
+  if [[ -n $body ]]; then
+    out=$(printf '%s' "$body" | curl "${args[@]}" -H 'Content-Type: application/json' --data-binary @- "$url") || { echo "请求 $path 失败" >&2; return 1; }
+  else
+    out=$(curl "${args[@]}" "$url") || { echo "请求 $path 失败" >&2; return 1; }
+  fi
   if ! jq -e 'type == "object" and .success == true' >/dev/null 2>&1 <<<"$out"; then
     echo "接口 $path 返回失败:$(jq -r '.msg? // empty' 2>/dev/null <<<"$out" | head -c 300)" >&2
     return 1
@@ -146,8 +175,9 @@ wait_api() {
   done
   api GET /server/status >/dev/null || die "面板接口连不上(本机 ${API_PORT} 端口)"
 }
-# 用结果文件里的信息连面板
+# 用结果文件里的信息连面板(先 load_result)
 api_from_result() {
+  API_HOST=$DOMAIN
   API_PORT=$PANEL_PORT
   WBP=$WEB_BASE_PATH
   api_auth "$PANEL_TOKEN"
@@ -159,8 +189,8 @@ usage_install() {
   cat <<EOF
 用法: xui-node install [选项]
 
-在终端里运行时会一步一步问,方括号里是默认值;选项填过的就作为默认值。
-加 -y(或者不在终端里运行,比如通过 ssh 执行)就不问,直接用选项和默认值,这时 --domain 必填。
+在终端里运行时会一步一步问,方括号里是默认值(选项给过的、上次装时选的会作为默认值)。
+加 -y(或者不在终端里运行,比如通过 ssh 执行)就不问,直接用选项和默认值;第一次装时 --domain 必填。
 
   --domain FQDN            本机域名(要先解析到本机 IP;Cloudflare 用灰云)
   --panel-port N           面板端口(默认 ${DEFAULT_PANEL_PORT})
@@ -169,10 +199,10 @@ usage_install() {
   --xray-version vX.Y.Z    锁定的 Xray 内核版本(默认 ${DEFAULT_XRAY});keep = 用 3x-ui 自带的、不锁定
   --xui-version vX.Y.Z     3x-ui 版本(默认最新 release)
   --no-firewall            不启用本脚本的防火墙
-  --ssh-port N[,N]         防火墙放行的 SSH 端口(默认按 sshd 配置和当前连接)
-  --remark NAME            Reality 入站备注(默认域名第一段)
+  --ssh-port N[,N]         防火墙放行的 SSH 端口(默认自动识别:sshd 配置、实际监听、ssh.socket、当前连接,再加上次的)
+  --remark NAME            Reality 入站备注(默认域名第一段;只在新建入站时用)
   --ip IP                  本机公网 IPv4(默认自动探测)
-  --acme-email EMAIL       Let's Encrypt 账号邮箱(可不填)
+  --acme-email EMAIL       Let's Encrypt 账号邮箱(可不填;只在第一次签证书时用)
   --skip-dns-check         不检查域名是否已解析到本机
   -y, --yes                不问,直接装
 EOF
@@ -192,11 +222,7 @@ preflight() {
   esac
   case "$(uname -m)" in x86_64 | amd64 | aarch64 | arm64) ;; *) die "不支持的架构 $(uname -m)" ;; esac
   command -v systemctl >/dev/null || die "需要 systemd"
-  if ! command -v curl >/dev/null; then
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get update -qq
-    apt-get install -y -qq curl ca-certificates >/dev/null
-  fi
+  command -v curl >/dev/null || apt_install curl ca-certificates
 }
 
 detect_ip() {
@@ -205,16 +231,30 @@ detect_ip() {
   is_ipv4 "$PUBLIC_IP" || die "探测不到本机公网 IPv4,用 --ip 指定"
 }
 
+# 当前这条 SSH 连接连的是本机哪个端口(不是通过 SSH 运行时为空)
+current_ssh_port() {
+  if [[ -n ${SSH_CONNECTION:-} ]]; then awk '{print $4}' <<<"$SSH_CONNECTION"; fi
+}
+# SSH 端口:sshd 配置(Port、ListenAddress 里带的端口)+ sshd 实际在听的 + ssh.socket(Ubuntu 22.10 起常由它监听)+ 当前连接
 detect_ssh_ports() {
-  local p
-  p=$( (sshd -T 2>/dev/null || true) | awk '$1=="port"{print $2}' | xargs)
-  # 当前这条 SSH 连接用的端口也放行,免得把自己关在外面
-  [[ -z ${SSH_CONNECTION:-} ]] || p="$p $(awk '{print $4}' <<<"$SSH_CONNECTION")"
-  words "${p:-22}"
+  local p=""
+  p+=" $( (sshd -T 2>/dev/null || true) | awk '$1=="port"{print $2} $1=="listenaddress"{n=split($2,a,":"); if (n>1) print a[n]}' || true)"
+  p+=" $(ss -Hltnp 2>/dev/null | awk '/"sshd"/{n=split($4,a,":"); print a[n]}' || true)"
+  if systemctl is-active -q ssh.socket 2>/dev/null; then
+    p+=" $(systemctl show -p Listen ssh.socket 2>/dev/null | grep -oE '[0-9]+ \(Stream\)' | cut -d' ' -f1 || true)"
+  fi
+  p+=" $(current_ssh_port)"
+  words "$p"
+}
+fw_conf_get() {
+  [[ -f $FW_CONF ]] || return 0
+  # shellcheck disable=SC1090
+  (set +u; . "$FW_CONF"; printf '%s' "${!1:-}")
 }
 
 # 通过 Cloudflare DoH 查 A 记录(不用本机 DNS 缓存)
 RESOLVED=""
+DNS_OK=0
 dns_points_here() {
   RESOLVED=$(curl -fsS --max-time 10 -H 'accept: application/dns-json' "https://1.1.1.1/dns-query?name=${DOMAIN}&type=A" 2>/dev/null |
     grep -oE '"data":"[0-9]{1,3}(\.[0-9]{1,3}){3}"' | cut -d'"' -f4 | xargs || true)
@@ -264,10 +304,17 @@ v_ssh_ports() {
   done
 }
 
-validate_all() {
-  local w
+# 参数的格式、端口冲突、域名解析(向导里已经查过解析的不再查)
+validate_inputs() {
+  local cur
   is_domain "$DOMAIN" || die "域名不对: ${DOMAIN:-没填}(用 --domain 指定)"
   DOMAIN=${DOMAIN,,}
+  # 当前这条 SSH 连接的端口一定放行:不然断开后就连不回来了
+  cur=$(current_ssh_port)
+  if [[ $FIREWALL == 1 && -n $cur && " $(words "$SSH_PORTS") " != *" $cur "* ]]; then
+    SSH_PORTS="$SSH_PORTS $cur"
+    warn "当前 SSH 连接用的 $cur 端口也会放行(免得断开后连不回来)"
+  fi
   v_ssh_ports "$SSH_PORTS" || die "SSH 端口不对: $SSH_PORTS"
   v_panel_port "$PANEL_PORT" || die "面板端口 $PANEL_PORT 不能用"
   v_reality_port "$REALITY_PORT" || die "Reality 端口 $REALITY_PORT 不能用"
@@ -280,11 +327,60 @@ validate_all() {
   REALITY_PORT=$((10#$REALITY_PORT))
   SOCKS_PORT=$((10#$SOCKS_PORT))
   SSH_PORTS=$(words "$SSH_PORTS")
+  if [[ $SKIP_DNS_CHECK -eq 0 && $DNS_OK -eq 0 ]]; then
+    dns_points_here || die "$DOMAIN 现在解析到「${RESOLVED:-没有 A 记录}」,不是本机 $PUBLIC_IP。先把 A 记录指向本机(Cloudflare 用灰云)再装"
+    DNS_OK=1
+  fi
+}
+
+# 装完依赖后(ss 一定有了)再核对一遍端口有没有被别的程序占着
+recheck_ports() {
+  local w
   w=$(port_owner 80)
   [[ -z $w || $w =~ \"nginx\" ]] || die "80 端口被别的程序占用(签证书要用):${w%%$'\n'*}"
-  if [[ $SKIP_DNS_CHECK -eq 0 ]] && ! dns_points_here; then
-    die "$DOMAIN 现在解析到「${RESOLVED:-没有 A 记录}」,不是本机 $PUBLIC_IP。先把 A 记录指向本机(Cloudflare 用灰云)再装"
+  v_panel_port "$PANEL_PORT" || die "面板端口 $PANEL_PORT 不能用"
+  v_reality_port "$REALITY_PORT" || die "Reality 端口 $REALITY_PORT 不能用"
+}
+
+# 本机上本脚本建的 Reality 入站(target 指向本机站点的 vless)要和这次的端口、域名对得上;对不上就停下,什么都不改。
+# 对得上 REALITY_EXISTS=1;还没有 REALITY_EXISTS=0
+REALITY_EXISTS=0
+check_reality() {
+  local inbounds=$1 managed ib other names
+  managed=$(jq -c --arg t "127.0.0.1:$SITE_PORT" '[.[]? | select(.protocol == "vless")
+    | select(((.streamSettings | if type == "string" then (fromjson? // {}) else . end).realitySettings.target // "") == $t)]' <<<"$inbounds")
+  ib=$(jq -c --argjson p "$REALITY_PORT" '[.[] | select(.port == $p)][0] // empty' <<<"$managed")
+  if [[ -z $ib ]]; then
+    other=$(jq -r '[.[] | .port | tostring] | join("、")' <<<"$managed")
+    [[ -z $other ]] ||
+      die "本机的 Reality 入站在 $other 端口,这次填的是 $REALITY_PORT。脚本不改已有入站的端口(用户的链接都要跟着变):要换就先在面板里改好入站端口再重跑,不换就重跑时填 $other"
+    other=$(jq -r --argjson p "$REALITY_PORT" '[.[]? | select(.port == $p)][0] | if . == null then "" else (.remark // "") + "(" + (.protocol // "") + ")" end' <<<"$inbounds")
+    [[ -z $other ]] || die "面板上 $REALITY_PORT 端口已经有入站 $other,换个 Reality 端口,或者先在面板里删掉它"
+    REALITY_EXISTS=0
+    return 0
   fi
+  names=$(jq -r '(.streamSettings | if type == "string" then (fromjson? // {}) else . end).realitySettings.serverNames // [] | join(" ")' <<<"$ib")
+  [[ " $names " == *" $DOMAIN "* ]] ||
+    die "本机 $REALITY_PORT 端口 Reality 入站的 SNI 是「${names:-空}」,不含 $DOMAIN。脚本不改已有入站的 SNI:要换域名就先在面板里把 SNI 改成 $DOMAIN 再重跑,不换就重跑时填原来的域名"
+  REALITY_EXISTS=1
+}
+
+# 重新安装前:用上次的面板信息读已有入站,端口 / 域名对不上就在改任何东西之前停下
+precheck_existing() {
+  local token domain port wbp inbounds
+  token=$(result_get PANEL_TOKEN)
+  domain=$(result_get DOMAIN)
+  port=$(result_get PANEL_PORT)
+  wbp=$(result_get WEB_BASE_PATH)
+  [[ -n $token && -n $domain && -n $port && -n $wbp ]] || return 0
+  systemctl is-active -q x-ui || return 0
+  API_HOST=$domain API_PORT=$port WBP=$wbp
+  api_auth "$token"
+  if ! inbounds=$(api GET /inbounds/list 2>/dev/null); then
+    warn "用上次的信息连不上面板,先不核对已有入站"
+    return 0
+  fi
+  check_reality "$inbounds"
 }
 
 # ---------------- 安装:向导 ----------------
@@ -343,7 +439,10 @@ wizard() {
         *) ;;
       esac
     done
-    [[ $SKIP_DNS_CHECK -eq 1 ]] || ok "$DOMAIN 已解析到本机"
+    if [[ $SKIP_DNS_CHECK -eq 0 ]]; then
+      DNS_OK=1
+      ok "$DOMAIN 已解析到本机"
+    fi
   fi
   read -rp "    证书提醒邮箱(可留空,直接回车): " a || die "输入中断"
   a=$(trim "$a")
@@ -372,6 +471,7 @@ wizard() {
 
   ask_title 6 "防火墙"
   hint "nftables:只放行 SSH、80 和上面几个端口(对所有 IP),其余入站连接全部丢弃。"
+  hint "SSH 端口已自动识别;装到最后才生效,生效后会请你新开一个 SSH 确认能登录,${FW_CONFIRM_SECONDS} 秒内不确认就自动撤销。"
   if ask_yn "启用防火墙" "$([[ $FIREWALL == 1 ]] && echo y || echo n)"; then
     FIREWALL=1
     ask SSH_PORTS "SSH 端口(多个用逗号隔开)" "$(words "$SSH_PORTS" | tr ' ' ',')" v_ssh_ports
@@ -387,6 +487,7 @@ fw_open_ports() {
 }
 
 show_plan() {
+  local extra
   printf '\n'
   info "域名          $DOMAIN"
   info "公网 IP       $PUBLIC_IP"
@@ -395,7 +496,8 @@ show_plan() {
   if [[ $SOCKS_PORT == 0 ]]; then info "SOCKS 预留    不预留"; else info "SOCKS 预留    $SOCKS_PORT(只放行,不建入站)"; fi
   if [[ $XRAY_VERSION == keep ]]; then info "Xray 内核     3x-ui 自带的版本,不锁定"; else info "Xray 内核     $XRAY_VERSION(锁定)"; fi
   if [[ $FIREWALL == 1 ]]; then
-    info "防火墙        放行 TCP $(words "$SSH_PORTS $(fw_open_ports)" | sed 's/ /, /g'),其余丢弃"
+    extra=$(fw_conf_get EXTRA_PORTS)
+    info "防火墙        放行 TCP $(words "$SSH_PORTS $(fw_open_ports) $extra" | sed 's/ /, /g'),其余丢弃(SSH:$(words "$SSH_PORTS" | sed 's/ /, /g'))"
   else
     info "防火墙        不启用"
   fi
@@ -405,91 +507,26 @@ show_plan() {
 setup_deps() {
   local out
   step "安装依赖(curl jq nginx certbot nftables …)"
-  export DEBIAN_FRONTEND=noninteractive
-  apt-get update -qq
-  apt-get install -y -qq curl ca-certificates jq nginx certbot nftables openssl iproute2 >/dev/null
+  apt_install curl ca-certificates jq nginx certbot nftables openssl iproute2
   # 甲骨文云等镜像自带 iptables 规则,会和本脚本的规则叠加,把 80/443 挡掉
   out=$(iptables -S INPUT 2>/dev/null || true)
   if grep -qE -- '-P INPUT DROP|-j (REJECT|DROP)' <<<"$out"; then
     warn "系统里还有 iptables 规则在拦入站连接(甲骨文云等镜像常见),可能挡掉 80 / 443,请先清理:iptables -S INPUT"
   fi
-}
-
-setup_firewall() {
-  step "防火墙(nftables)"
-  if [[ $FIREWALL != 1 ]]; then
-    systemctl disable "$FW_UNIT" >/dev/null 2>&1 || true
-    if nft list table inet "$FW_TABLE" >/dev/null 2>&1; then
-      nft delete table inet "$FW_TABLE"
-      info "已撤掉之前装的防火墙规则"
+  # ufw 开着会挡签证书用的 80:要用本脚本的防火墙就关掉它,不用就提醒
+  out=$(ufw status 2>/dev/null || true)
+  if [[ $out == *"Status: active"* ]]; then
+    if [[ $FIREWALL == 1 ]]; then
+      ufw --force disable >/dev/null
+      warn "ufw 开着,会和本脚本的规则叠加,已关闭 ufw"
     else
-      info "不启用"
+      warn "ufw 开着:要在 ufw 里放行 80、$REALITY_PORT、$PANEL_PORT,否则签证书和连接会失败"
     fi
-    return 0
   fi
-  install -d -m 700 "$STATE_DIR"
-  printf 'SSH_PORTS=%q\nOPEN_PORTS=%q\n' "$SSH_PORTS" "$(fw_open_ports)" >"$FW_CONF"
-  cat >"/etc/systemd/system/$FW_UNIT" <<EOF
-[Unit]
-Description=xui-node firewall (nftables table inet ${FW_TABLE})
-Wants=network-pre.target
-Before=network-pre.target
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=/usr/sbin/nft -f ${FW_RULES}
-ExecStop=/usr/sbin/nft delete table inet ${FW_TABLE}
-
-[Install]
-WantedBy=multi-user.target
-EOF
-  if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q 'Status: active'; then
-    warn "ufw 开着,会和本脚本的规则叠加,已关闭 ufw"
-    ufw --force disable >/dev/null
-  fi
-  fw_apply
-  systemctl daemon-reload
-  systemctl enable "$FW_UNIT" >/dev/null 2>&1
-  info "开机自动加载;查看:xui-node fw"
-  hint "服务商如果还有安全组 / 云防火墙,也要放行这些端口。"
-}
-
-fw_render() {
-  cat <<EOF
-table inet ${FW_TABLE}
-delete table inet ${FW_TABLE}
-table inet ${FW_TABLE} {
-  chain input {
-    type filter hook input priority filter; policy drop;
-    ct state established,related accept
-    ct state invalid drop
-    iif "lo" accept
-    meta l4proto icmp accept
-    meta l4proto ipv6-icmp accept
-    udp dport { 68, 546 } accept
-    tcp dport { $(words "$SSH_PORTS $OPEN_PORTS" | sed 's/ /, /g') } accept
-  }
-}
-EOF
-}
-fw_apply() {
-  local tmp
-  [[ -f $FW_CONF ]] || die "没有 $FW_CONF(防火墙没启用)"
-  # shellcheck disable=SC1090
-  . "$FW_CONF"
-  [[ -n $(words "${SSH_PORTS:-}") ]] || die "$FW_CONF 里没有 SSH 端口,不应用(免得把自己关在外面)"
-  tmp=$(mktemp "$STATE_DIR/.fw.XXXXXX")
-  fw_render >"$tmp"
-  nft -c -f "$tmp" || { rm -f "$tmp"; die "规则检查没通过"; }
-  mv "$tmp" "$FW_RULES"
-  chmod 600 "$FW_RULES"
-  nft -f "$FW_RULES"
-  ok "防火墙已生效:放行 TCP $(words "$SSH_PORTS $OPEN_PORTS" | sed 's/ /, /g')"
 }
 
 setup_site() {
-  local title nginx_ver listen_tls listen_v6 acct
+  local title nginx_ver listen_tls listen_v6 acct site_url
   step "Nginx 站点 + Let's Encrypt 证书"
   install -d -m 755 "$SITE_ROOT" "$ACME_ROOT"
   if [[ ! -f $SITE_ROOT/index.html ]]; then
@@ -540,9 +577,12 @@ EOF
     listen_tls="listen 127.0.0.1:${SITE_PORT} ssl http2;"
   fi
   CERT_DIR=/etc/letsencrypt/live/$DOMAIN
-  # 内核关了 IPv6 时 Nginx 听 [::]:80 会起不来
+  # 内核关了 IPv6 时 Nginx 听 [::]:80 会起不来(procfs 的文件大小总是 0,要看内容)
   listen_v6=""
-  [[ ! -s /proc/net/if_inet6 ]] || listen_v6="listen [::]:80 default_server;"
+  [[ -z $(cat /proc/net/if_inet6 2>/dev/null || true) ]] || listen_v6="listen [::]:80 default_server;"
+  # 80 端口跳到真站点:对外只有 Reality 端口能看到它
+  site_url="https://${DOMAIN}"
+  [[ $REALITY_PORT == 443 ]] || site_url+=":${REALITY_PORT}"
   write_nginx() {
     {
       cat <<EOF
@@ -552,7 +592,7 @@ server {
     ${listen_v6}
     server_name _;
     location ^~ /.well-known/acme-challenge/ { root ${ACME_ROOT}; default_type text/plain; }
-    location / { return 301 https://${DOMAIN}\$request_uri; }
+    location / { return 301 ${site_url}\$request_uri; }
 }
 EOF
       if [[ -f $CERT_DIR/fullchain.pem ]]; then
@@ -587,12 +627,19 @@ EOF
       --key-type ecdsa --deploy-hook "systemctl reload nginx" -q ||
       die "签证书失败:确认 $DOMAIN 已解析到本机($PUBLIC_IP)、是灰云,且 80 端口没被服务商的安全组挡住"
   fi
-  # 续期后:Nginx 重载;给面板发 HUP 只重启面板网页(不重启 Xray),换上新证书
+  # 续期后:Nginx 马上重载。面板要重启才换上新证书,而 x-ui 重启会连 Xray 一起重启(在线用户断几秒),
+  # 所以放到下一个凌晨 4 点(本机时区);排不上定时就马上重启
   install -d -m 755 "$(dirname "$RENEW_HOOK")"
   cat >"$RENEW_HOOK" <<'EOF'
 #!/bin/sh
+# 由 xui-node 生成:证书续期后执行
 systemctl reload nginx || true
-systemctl kill -s HUP --kill-who=main x-ui 2>/dev/null || true
+systemctl is-active -q xui-node-panel-cert.timer && exit 0
+now=$(date +%s)
+at=$(date -d '04:00' +%s)
+[ "$at" -gt "$now" ] || at=$(date -d 'tomorrow 04:00' +%s)
+systemd-run --quiet --unit=xui-node-panel-cert --on-active=$((at - now)) "$(command -v systemctl)" kill -s HUP --kill-who=main x-ui ||
+  systemctl kill -s HUP --kill-who=main x-ui || true
 EOF
   chmod 755 "$RENEW_HOOK"
   systemctl enable --now certbot.timer >/dev/null 2>&1 || true
@@ -603,7 +650,7 @@ EOF
 }
 
 setup_xui() {
-  local tmp_port xu xp token tokens settings who
+  local tmp_port xu xp token tokens settings sub_port who
   step "安装 3x-ui"
   work_dir
   if [[ -x $XUI_BIN ]] && systemctl is-active -q x-ui; then
@@ -615,7 +662,7 @@ setup_xui() {
     fi
     info "版本 $XUI_VERSION"
     curl -fsSL --max-time 60 "https://raw.githubusercontent.com/MHSanaei/3x-ui/${XUI_VERSION}/install.sh" -o "$WORK/install.sh"
-    # 先用临时端口装:3x-ui 自带的订阅服务默认占着 2096,关掉它之后再把面板换到 $PANEL_PORT
+    # 先用临时端口装:3x-ui 自带的订阅服务默认占着 2096,把它挪开之后再把面板换到 $PANEL_PORT
     tmp_port=$(random_free_port) || die "挑不到空闲端口"
     # 安装器会把面板账号、密码、token 打印出来:滤掉这些行,只留进度
     if ! XUI_NONINTERACTIVE=1 XUI_PANEL_PORT="$tmp_port" XUI_SSL_MODE=none XUI_DB_TYPE=sqlite XUI_ENABLE_FAIL2BAN=false \
@@ -644,6 +691,7 @@ setup_xui() {
   result_set PANEL_URL "https://${DOMAIN}:${PANEL_PORT}/${WBP}"
   result_set PANEL_URL_IP "https://${PUBLIC_IP}:${PANEL_PORT}/${WBP}"
   # 面板现在实际在用的端口(刚装好时是临时端口)
+  API_HOST=$DOMAIN
   API_PORT=$($XUI_BIN setting -show 2>/dev/null | sed -n 's/^port: *//p' | tr -d '[:space:]')
   is_port "$API_PORT" || die "读不到面板端口"
 
@@ -667,13 +715,18 @@ setup_xui() {
     done
   fi
 
-  # 订阅备注模板 {{INBOUND}};关掉 3x-ui 自带的订阅服务(它默认占 2096)
+  # 订阅备注模板 {{INBOUND}};关掉 3x-ui 自带的订阅服务,并把它的端口挪开
+  # (它默认占 2096;面板不允许订阅端口和面板端口相同,关着也不行,否则以后在面板里保存设置会失败)
   settings=$(api POST /setting/all)
-  if [[ $(jq -r '"\(.remarkTemplate // "")|\(.subEnable)"' <<<"$settings") != '{{INBOUND}}|false' ]]; then
-    api POST /setting/update "$(jq -c '.remarkTemplate = "{{INBOUND}}" | .subEnable = false' <<<"$settings")" >/dev/null ||
+  sub_port=$(jq -r '.subPort // 0' <<<"$settings")
+  if [[ $sub_port == "$PANEL_PORT" || $sub_port == "$REALITY_PORT" || $sub_port == "$SOCKS_PORT" ]] || ! is_port "$sub_port"; then
+    sub_port=$(random_free_port) || die "挑不到空闲端口"
+  fi
+  if [[ $(jq -r '"\(.remarkTemplate // "")|\(.subEnable)|\(.subPort)"' <<<"$settings") != "{{INBOUND}}|false|$sub_port" ]]; then
+    api POST /setting/update "$(jq -c --argjson sp "$sub_port" '.remarkTemplate = "{{INBOUND}}" | .subEnable = false | .subPort = $sp' <<<"$settings")" >/dev/null ||
       die "改面板设置失败"
   fi
-  [[ $(api POST /setting/all | jq -r '"\(.remarkTemplate)|\(.subEnable)"') == '{{INBOUND}}|false' ]] || die "面板设置没改成"
+  [[ $(api POST /setting/all | jq -r '"\(.remarkTemplate)|\(.subEnable)|\(.subPort)"') == "{{INBOUND}}|false|$sub_port" ]] || die "面板设置没改成"
   unset settings
   info "订阅备注模板 {{INBOUND}},自带订阅服务已关"
 
@@ -741,39 +794,34 @@ EOF
 }
 
 setup_inbound() {
-  local inbounds existing sni keys sids stream body
+  local keys stream body
   step "VLESS + Reality 入站(端口 $REALITY_PORT,伪装目标 127.0.0.1:$SITE_PORT,SNI $DOMAIN)"
-  inbounds=$(api GET /inbounds/list)
-  existing=$(jq -c --argjson p "$REALITY_PORT" '[.[]? | select(.port == $p and .protocol == "vless")][0] // empty' <<<"$inbounds")
-  if [[ -n $existing ]]; then
-    sni=$(jq -r '(.streamSettings | if type == "string" then (fromjson? // {}) else . end) | .realitySettings.serverNames // [] | join(",")' <<<"$existing")
-    if [[ $sni == "$DOMAIN" ]]; then
-      info "已有,跳过"
-    else
-      warn "端口 $REALITY_PORT 已有 vless 入站,但 SNI 是「${sni:-空}」不是 $DOMAIN:到面板里把它的 Reality 设置改成 target 127.0.0.1:$SITE_PORT、SNI $DOMAIN"
-    fi
+  check_reality "$(api GET /inbounds/list)"
+  if [[ $REALITY_EXISTS == 1 ]]; then
+    info "已有,跳过"
     return 0
   fi
+  # 私钥只经过标准输入,不出现在命令行里
   keys=$(api GET /server/getNewX25519Cert)
-  sids=$(jq -nc --arg a "$(rand_hex 1)" --arg b "$(rand_hex 2)" --arg c "$(rand_hex 3)" --arg d "$(rand_hex 4)" \
-    --arg e "$(rand_hex 5)" --arg f "$(rand_hex 6)" --arg g "$(rand_hex 7)" --arg h "$(rand_hex 8)" '[$a,$b,$c,$d,$e,$f,$g,$h]')
-  stream=$(jq -nc --arg d "$DOMAIN" --arg t "127.0.0.1:$SITE_PORT" --argjson k "$keys" --argjson s "$sids" '{
-    network: "tcp", security: "reality", externalProxy: [],
-    tcpSettings: { acceptProxyProtocol: false, header: { type: "none" } },
-    realitySettings: {
-      show: false, xver: 0, target: $t, serverNames: [$d],
-      privateKey: $k.privateKey, minClientVer: "", maxClientVer: "", maxTimediff: 0, shortIds: $s, mldsa65Seed: "",
-      settings: { publicKey: $k.publicKey, fingerprint: "chrome", serverName: "", spiderX: "/", mldsa65Verify: "" }
-    }
-  }')
-  body=$(jq -nc --arg remark "$REMARK" --argjson port "$REALITY_PORT" --arg stream "$stream" '{
+  stream=$(printf '%s\n' "$keys" "$(jq -nc --arg a "$(rand_hex 1)" --arg b "$(rand_hex 2)" --arg c "$(rand_hex 3)" --arg d "$(rand_hex 4)" \
+    --arg e "$(rand_hex 5)" --arg f "$(rand_hex 6)" --arg g "$(rand_hex 7)" --arg h "$(rand_hex 8)" '[$a,$b,$c,$d,$e,$f,$g,$h]')" |
+    jq -cs --arg d "$DOMAIN" --arg t "127.0.0.1:$SITE_PORT" '.[0] as $k | .[1] as $s | {
+      network: "tcp", security: "reality", externalProxy: [],
+      tcpSettings: { acceptProxyProtocol: false, header: { type: "none" } },
+      realitySettings: {
+        show: false, xver: 0, target: $t, serverNames: [$d],
+        privateKey: $k.privateKey, minClientVer: "", maxClientVer: "", maxTimediff: 0, shortIds: $s, mldsa65Seed: "",
+        settings: { publicKey: $k.publicKey, fingerprint: "chrome", serverName: "", spiderX: "/", mldsa65Verify: "" }
+      }
+    }')
+  body=$(jq -c --arg remark "$REMARK" --argjson port "$REALITY_PORT" '{
     up: 0, down: 0, total: 0, remark: $remark, enable: true, expiryTime: 0, listen: "", port: $port, protocol: "vless",
     settings: ({ clients: [], decryption: "none", encryption: "none", fallbacks: [] } | tojson),
-    streamSettings: $stream,
+    streamSettings: tojson,
     sniffing: ({ enabled: false, destOverride: ["http", "tls", "quic", "fakedns"], metadataOnly: false, routeOnly: false } | tojson)
-  }')
+  }' <<<"$stream")
   api POST /inbounds/add "$body" >/dev/null || die "新建入站失败"
-  unset keys stream body sids
+  unset keys stream body
   ok "已新建(备注 $REMARK,还没有用户)"
 }
 
@@ -799,8 +847,136 @@ final_check() {
   ok "Xray ${st%%|*} 在运行;$REALITY_PORT 端口没认证的访问看到的是 $DOMAIN 的站点"
 }
 
+# ---------------- 防火墙 ----------------
+fw_write_conf() { # fw_write_conf SSH端口 本脚本管的端口 额外端口
+  cat >"$FW_CONF" <<EOF
+# xui-node 防火墙配置,改完执行 xui-node fw apply
+# SSH_PORTS:SSH 端口(每次 apply 都会把自动识别到的并进来,不会少)
+# OPEN_PORTS:本脚本管的端口(重新安装时按设置重写)
+# EXTRA_PORTS:你自己要额外放行的 TCP 端口(重新安装时保留)
+SSH_PORTS=$(printf '%q' "$1")
+OPEN_PORTS=$(printf '%q' "$2")
+EXTRA_PORTS=$(printf '%q' "$3")
+EOF
+  chmod 600 "$FW_CONF"
+}
+
+fw_render() { # fw_render 放行的端口
+  cat <<EOF
+table inet ${FW_TABLE}
+delete table inet ${FW_TABLE}
+table inet ${FW_TABLE} {
+  chain input {
+    type filter hook input priority filter; policy drop;
+    ct state established,related accept
+    ct state invalid drop
+    iif "lo" accept
+    meta l4proto icmp accept
+    meta l4proto ipv6-icmp accept
+    udp dport { 68, 546 } accept
+    tcp dport { $(words "$1" | sed 's/ /, /g') } accept
+  }
+}
+EOF
+}
+
+fw_revert() {
+  nft delete table inet "$FW_TABLE" 2>/dev/null || true
+  systemctl disable "$FW_UNIT" >/dev/null 2>&1 || true
+  result_set FIREWALL 0
+}
+
+# 按配置生成规则并生效。confirm=1:生效后请人新开 SSH 确认,超时自动撤销(人不在了也由定时器撤销)
+fw_apply() {
+  local confirm=${1:-0} ssh open extra tmp ports
+  [[ -f $FW_CONF ]] || die "没有 $FW_CONF(防火墙没启用,用 xui-node install 开)"
+  ssh=$(words "$(fw_conf_get SSH_PORTS) $(detect_ssh_ports)")
+  open=$(fw_conf_get OPEN_PORTS)
+  extra=$(fw_conf_get EXTRA_PORTS)
+  [[ -n $ssh ]] || die "识别不到 SSH 端口,$FW_CONF 里也没有:不应用(免得把自己关在外面)"
+  fw_write_conf "$ssh" "$open" "$extra"
+  ports=$(words "$ssh $open $extra")
+  tmp=$(mktemp "$STATE_DIR/.fw.XXXXXX")
+  fw_render "$ports" >"$tmp"
+  nft -c -f "$tmp" || { rm -f "$tmp"; die "规则检查没通过"; }
+  # 开机自动加载(没确认被撤销时会再关掉)
+  systemctl daemon-reload
+  systemctl enable "$FW_UNIT" >/dev/null 2>&1
+  if nft list table inet "$FW_TABLE" >/dev/null 2>&1 && cmp -s "$tmp" "$FW_RULES"; then
+    rm -f "$tmp"
+    ok "防火墙规则没变:放行 TCP $(sed 's/ /, /g' <<<"$ports")"
+    return 0
+  fi
+  mv "$tmp" "$FW_RULES"
+  chmod 600 "$FW_RULES"
+  if [[ $confirm == 1 ]]; then
+    systemctl stop "$FW_REVERT.timer" >/dev/null 2>&1 || true
+    systemd-run --quiet --unit="$FW_REVERT" --on-active="$((FW_CONFIRM_SECONDS + 30))" /bin/sh -c \
+      "nft delete table inet $FW_TABLE; systemctl disable $FW_UNIT" >/dev/null 2>&1 ||
+      warn "排不上自动撤销的定时器,确认时请别断开当前连接"
+  fi
+  nft -f "$FW_RULES"
+  ok "防火墙已生效:放行 TCP $(sed 's/ /, /g' <<<"$ports")(SSH:$(sed 's/ /, /g' <<<"$ssh"))"
+  [[ $confirm == 1 ]] || return 0
+  printf '\n'
+  info "现在新开一个终端,用 SSH 登录这台机器试试(当前这个连接不受影响)。"
+  if read -r -t "$FW_CONFIRM_SECONDS" -p "    能登录就回车确认(${FW_CONFIRM_SECONDS} 秒内不确认会自动撤销防火墙): " _; then
+    systemctl stop "$FW_REVERT.timer" >/dev/null 2>&1 || true
+    result_set FIREWALL 1
+    ok "已确认"
+  else
+    printf '\n'
+    systemctl stop "$FW_REVERT.timer" >/dev/null 2>&1 || true
+    fw_revert
+    warn "没有确认,防火墙已撤销。确认 SSH 端口后(编辑 $FW_CONF)执行 xui-node fw apply 再开"
+  fi
+}
+
+setup_firewall() {
+  local extra
+  step "防火墙(nftables)"
+  if [[ $FIREWALL != 1 ]]; then
+    systemctl disable "$FW_UNIT" >/dev/null 2>&1 || true
+    if nft list table inet "$FW_TABLE" >/dev/null 2>&1; then
+      nft delete table inet "$FW_TABLE"
+      info "已撤掉之前装的防火墙规则"
+    else
+      info "不启用"
+    fi
+    return 0
+  fi
+  install -d -m 700 "$STATE_DIR"
+  extra=$(fw_conf_get EXTRA_PORTS)
+  fw_write_conf "$SSH_PORTS" "$(fw_open_ports)" "$extra"
+  # 不用默认依赖:跟 Debian 自带的 nftables.service 一样,免得开机时和 cloud-init / 网络服务排成环
+  cat >"/etc/systemd/system/$FW_UNIT" <<EOF
+[Unit]
+Description=xui-node firewall (nftables table inet ${FW_TABLE})
+DefaultDependencies=no
+Wants=network-pre.target
+Before=network-pre.target shutdown.target
+After=local-fs.target
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f ${FW_RULES}
+ExecStop=/usr/sbin/nft delete table inet ${FW_TABLE}
+
+[Install]
+WantedBy=sysinit.target
+EOF
+  # 旧版本装在 multi-user.target 下,先撤掉再按新的装
+  systemctl disable "$FW_UNIT" >/dev/null 2>&1 || true
+  fw_apply "$INTERACTIVE"
+  hint "开机自动加载;查看:xui-node fw。服务商如果还有安全组 / 云防火墙,也要放行这些端口。"
+}
+
+# ---------------- 安装 ----------------
+INTERACTIVE=0
 cmd_install() {
-  local yes=0 interactive=0
+  local yes=0 prev_ssh
   DOMAIN="" PANEL_PORT="" REALITY_PORT="" SOCKS_PORT="" XRAY_VERSION="" XUI_VERSION=latest
   SSH_PORTS="" FIREWALL="" REMARK="" PUBLIC_IP="" ACME_EMAIL="" SKIP_DNS_CHECK=0 CERT_DIR=""
   while [[ $# -gt 0 ]]; do
@@ -824,7 +1000,7 @@ cmd_install() {
   done
   trap 'die "第 $LINENO 行出错(命令: $BASH_COMMAND)"' ERR
   need_root
-  if [[ -t 0 && $yes -eq 0 ]]; then interactive=1; fi
+  if [[ -t 0 && $yes -eq 0 ]]; then INTERACTIVE=1; fi
   preflight
   ensure_bin
   detect_ip
@@ -841,23 +1017,28 @@ cmd_install() {
   SOCKS_PORT=${SOCKS_PORT:-$DEFAULT_SOCKS_PORT}
   XRAY_VERSION=${XRAY_VERSION:-$DEFAULT_XRAY}
   FIREWALL=${FIREWALL:-1}
-  [[ -n $SSH_PORTS ]] || SSH_PORTS=$(detect_ssh_ports)
+  # SSH 端口:没指定就把上次的、防火墙配置里的、自动识别的都并起来(只会多,不会把人关在外面)
+  if [[ -z $SSH_PORTS ]]; then
+    prev_ssh="$(result_get SSH_PORTS) $(fw_conf_get SSH_PORTS)"
+    SSH_PORTS=$(words "$prev_ssh $(detect_ssh_ports)")
+    if [[ -z $SSH_PORTS ]]; then
+      SSH_PORTS=22
+      warn "识别不出 SSH 端口,按 22;不对的话用 --ssh-port 指定"
+    fi
+  fi
 
-  if [[ $interactive -eq 1 ]]; then
-    wizard
-    validate_all
-    show_plan
+  if [[ $INTERACTIVE -eq 1 ]]; then wizard; fi
+  validate_inputs
+  show_plan
+  if [[ $INTERACTIVE -eq 1 ]]; then
     printf '\n'
     ask_yn "开始安装" y || { info "已取消"; exit 0; }
-  else
-    validate_all
-    show_plan
   fi
   REMARK=${REMARK:-${DOMAIN%%.*}}
 
   setup_deps
-  # 依赖装好后(ss 一定有了)再核对一遍端口
-  validate_all
+  recheck_ports
+  precheck_existing
   result_set XUI_NODE_VERSION "$XUI_NODE_VERSION"
   result_set DOMAIN "$DOMAIN"
   result_set PUBLIC_IP "$PUBLIC_IP"
@@ -868,14 +1049,16 @@ cmd_install() {
   result_set FIREWALL "$FIREWALL"
   result_set SSH_PORTS "$SSH_PORTS"
 
-  setup_firewall
   setup_site
   setup_xui
   setup_xray
   setup_inbound
   final_check
+  # 防火墙最后上:前面哪步失败都不会动到它;在终端里装时生效后要确认 SSH 还能登录
+  setup_firewall
 
   step "完成"
+  FIREWALL=$(result_get FIREWALL)
   show_plan
   printf '\n'
   info "面板地址、登录账号和 API token 保存在 $RESULT(只有 root 可读,安装过程中没有打印)。"
@@ -931,9 +1114,7 @@ cmd_status() {
   fi
   if [[ -n $end ]]; then info "证书:到期 $end"; else info "证书:没找到"; fi
   if nft list table inet "$FW_TABLE" >/dev/null 2>&1; then
-    # shellcheck disable=SC1090
-    . "$FW_CONF"
-    info "防火墙:开,放行 TCP $(words "$SSH_PORTS $OPEN_PORTS" | sed 's/ /, /g')"
+    info "防火墙:开,放行 TCP $(words "$(fw_conf_get SSH_PORTS) $(fw_conf_get OPEN_PORTS) $(fw_conf_get EXTRA_PORTS)" | sed 's/ /, /g')"
   else
     info "防火墙:没开"
   fi
@@ -944,12 +1125,15 @@ cmd_fw() {
   case "${1:-show}" in
     show)
       if nft list table inet "$FW_TABLE" 2>/dev/null; then
-        hint "改端口:编辑 $FW_CONF,再执行 xui-node fw apply"
+        hint "加端口:编辑 $FW_CONF 的 EXTRA_PORTS,再执行 xui-node fw apply"
       else
         info "防火墙没开(xui-node install 时可以开)"
       fi
       ;;
-    apply) fw_apply ;;
+    apply)
+      install -d -m 700 "$STATE_DIR"
+      if [[ -t 0 ]]; then fw_apply 1; else fw_apply 0; fi
+      ;;
     *) die "用法: xui-node fw show|apply" ;;
   esac
 }
@@ -985,8 +1169,10 @@ cmd_update() {
 }
 
 cmd_menu() {
-  local c
+  local c self
   need_root
+  # 每一项都在单独的进程里跑:出错照常停下(在 || / if 里调函数,bash 会忽略 set -e)
+  self=$(self_path)
   while :; do
     printf '\n%sxui-node %s%s  3x-ui Reality 节点\n' "$C_B" "$XUI_NODE_VERSION" "$C_0"
     if [[ -f $RESULT ]]; then
@@ -1008,12 +1194,12 @@ cmd_menu() {
 EOF
     read -rp "请选择 [0-7]: " c || { echo; return 0; }
     case "$(trim "$c")" in
-      1) (cmd_install) || true ;;
-      2) (cmd_info) || true ;;
-      3) (cmd_status) || true ;;
-      4) (cmd_fw show) || true ;;
-      5) (cmd_xray_pin) || true ;;
-      6) if (cmd_update); then exec "$BIN"; fi ;;
+      1) bash "$self" install || true ;;
+      2) bash "$self" info || true ;;
+      3) bash "$self" status || true ;;
+      4) bash "$self" fw show || true ;;
+      5) bash "$self" xray-pin || true ;;
+      6) if bash "$self" update; then exec "$BIN"; fi ;;
       7) if command -v x-ui >/dev/null; then x-ui || true; else warn "还没装 3x-ui"; fi ;;
       0 | q) return 0 ;;
       *) warn "请输入 0-7"; continue ;;
