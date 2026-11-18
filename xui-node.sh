@@ -15,7 +15,7 @@
 set -Eeuo pipefail
 umask 022
 
-XUI_NODE_VERSION=1.0.1
+XUI_NODE_VERSION=1.0.2
 REPO=fishermanxzx/xui-node
 RAW_URL="https://raw.githubusercontent.com/${REPO}/${XUI_NODE_REF:-main}"
 
@@ -29,6 +29,9 @@ FW_UNIT=xui-node-fw.service
 FW_REVERT=xui-node-fw-revert
 PIN_UNIT=xui-node-xray-pin
 XUI_BIN=/usr/local/x-ui/x-ui
+XUI_RESULT=/etc/x-ui/install-result.env
+BBR_SYSCTL=/etc/sysctl.d/99-xui-node-bbr.conf
+BBR_MODULES=/etc/modules-load.d/xui-node-bbr.conf
 SITE_ROOT=/var/www/xui-node-site
 ACME_ROOT=/var/www/acme
 NGINX_CONF=/etc/nginx/conf.d/xui-node-site.conf
@@ -96,17 +99,24 @@ random_free_port() {
   return 1
 }
 
-# 结果文件:KEY=VALUE(%q 转义,可 source),只有 root 可读
-result_set() {
-  local key=$1 value=$2 tmp
-  install -d -m 700 "$STATE_DIR"
-  touch "$RESULT"
-  chmod 600 "$RESULT"
-  tmp=$(mktemp "$STATE_DIR/.result.XXXXXX")
-  grep -v "^${key}=" "$RESULT" >"$tmp" || true
-  printf '%s=%q\n' "$key" "$value" >>"$tmp"
+# KEY=VALUE 文件(%q 转义,可 source),只有 root 可读;改已有的行时保持原来的位置
+env_set() {
+  local file=$1 key=$2 tmp
+  touch "$file"
+  chmod 600 "$file"
+  tmp=$(mktemp "$(dirname "$file")/.env.XXXXXX")
+  # 值经环境变量传给 awk(-v 会把反斜杠当转义)
+  ENV_KEY=$key ENV_LINE="$key=$(printf '%q' "$3")" awk '
+    index($0, ENVIRON["ENV_KEY"] "=") == 1 { if (!done) print ENVIRON["ENV_LINE"]; done = 1; next }
+    { print }
+    END { if (!done) print ENVIRON["ENV_LINE"] }' "$file" >"$tmp"
   chmod 600 "$tmp"
-  mv "$tmp" "$RESULT"
+  mv "$tmp" "$file"
+}
+# 结果文件
+result_set() {
+  install -d -m 700 "$STATE_DIR"
+  env_set "$RESULT" "$1" "$2"
 }
 result_get() {
   [[ -f $RESULT ]] || return 0
@@ -495,6 +505,7 @@ show_plan() {
   info "Reality 端口  $REALITY_PORT(伪装目标 127.0.0.1:$SITE_PORT 上的本机站点,SNI $DOMAIN)"
   if [[ $SOCKS_PORT == 0 ]]; then info "SOCKS 预留    不预留"; else info "SOCKS 预留    $SOCKS_PORT(只放行,不建入站)"; fi
   if [[ $XRAY_VERSION == keep ]]; then info "Xray 内核     3x-ui 自带的版本,不锁定"; else info "Xray 内核     $XRAY_VERSION(锁定)"; fi
+  info "BBR           $BBR_NOTE"
   if [[ $FIREWALL == 1 ]]; then
     extra=$(fw_conf_get EXTRA_PORTS)
     info "防火墙        放行 TCP $(words "$SSH_PORTS $(fw_open_ports) $extra" | sed 's/ /, /g'),其余丢弃(SSH:$(words "$SSH_PORTS" | sed 's/ /, /g'))"
@@ -507,7 +518,7 @@ show_plan() {
 setup_deps() {
   local out
   step "安装依赖(curl jq nginx certbot nftables …)"
-  apt_install curl ca-certificates jq nginx certbot nftables openssl iproute2
+  apt_install curl ca-certificates jq nginx certbot nftables openssl iproute2 procps kmod
   # 甲骨文云等镜像自带 iptables 规则,会和本脚本的规则叠加,把 80/443 挡掉
   out=$(iptables -S INPUT 2>/dev/null || true)
   if grep -qE -- '-P INPUT DROP|-j (REJECT|DROP)' <<<"$out"; then
@@ -523,6 +534,52 @@ setup_deps() {
       warn "ufw 开着:要在 ufw 里放行 80、$REALITY_PORT、$PANEL_PORT,否则签证书和连接会失败"
     fi
   fi
+}
+
+BBR_NOTE="开启"
+bbr_state() {
+  printf '%s,队列 %s' "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo '?')" "$(sysctl -n net.core.default_qdisc 2>/dev/null || echo '?')"
+}
+
+# BBR:写进 sysctl.d(开机生效)并立即生效;内核不支持(OpenVZ / LXC 等容器)就提醒并跳过,不影响安装
+setup_bbr() {
+  local cc qd
+  step "开启 BBR"
+  modprobe tcp_bbr 2>/dev/null || true
+  if ! grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
+    warn "这台机器的内核不支持 BBR(OpenVZ / LXC 这类容器常见),跳过"
+    BBR_NOTE="内核不支持,没开"
+    return 0
+  fi
+  printf '%s\n' "# xui-node:开启 BBR" "net.core.default_qdisc = fq" "net.ipv4.tcp_congestion_control = bbr" >"$BBR_SYSCTL"
+  printf '%s\n' "tcp_bbr" >"$BBR_MODULES"
+  sysctl -q -p "$BBR_SYSCTL" >/dev/null 2>&1 || true
+  cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)
+  qd=$(sysctl -n net.core.default_qdisc 2>/dev/null || true)
+  if [[ $cc != bbr ]]; then
+    warn "BBR 没开成(现在是 ${cc:-未知}),不影响其它步骤"
+    BBR_NOTE="没开成(现在是 ${cc:-未知})"
+    return 0
+  fi
+  [[ $qd == fq ]] || hint "队列算法没改成 fq(现在是 ${qd:-未知}),BBR 照样能用"
+  BBR_NOTE="已开启"
+  ok "BBR 已开启(重启后保持,配置在 $BBR_SYSCTL)"
+}
+
+# 申请证书前先自查:在验证目录放一个测试文件,本机用域名访问 80 端口读回来,读不回来就不去找 Let's Encrypt
+# (同一域名一小时内验证失败 5 次会被暂时拒绝)。本机访问不经过外网,查不出服务商安全组挡 80 或开了橙云
+acme_selfcheck() {
+  local dir=$ACME_ROOT/.well-known/acme-challenge name body got
+  install -d -m 755 "$dir"
+  name="xui-node-check-$(rand_hex 8)"
+  body=$(rand_hex 16)
+  printf '%s' "$body" >"$dir/$name"
+  chmod 644 "$dir/$name"
+  got=$(curl -fsS --max-time 10 --resolve "$DOMAIN:80:127.0.0.1" "http://$DOMAIN/.well-known/acme-challenge/$name" 2>/dev/null || true)
+  rm -f "$dir/$name"
+  [[ $got == "$body" ]] ||
+    die "本机自查没通过:http://$DOMAIN/.well-known/acme-challenge/ 读不到测试文件(Nginx 80 端口没起来或配置不对),没去申请证书。排查:nginx -t; systemctl status nginx"
+  ok "本机自查通过:验证地址能访问"
 }
 
 setup_site() {
@@ -621,6 +678,7 @@ EOF
   write_nginx
 
   if [[ ! -f $CERT_DIR/fullchain.pem ]]; then
+    acme_selfcheck
     acct=(--register-unsafely-without-email)
     [[ -z $ACME_EMAIL ]] || acct=(-m "$ACME_EMAIL")
     certbot certonly --webroot -w "$ACME_ROOT" -d "$DOMAIN" --non-interactive --agree-tos "${acct[@]}" \
@@ -650,7 +708,7 @@ EOF
 }
 
 setup_xui() {
-  local tmp_port xu xp token tokens settings sub_port who
+  local tmp_port xu xp token settings sub_port who fresh=0
   step "安装 3x-ui"
   work_dir
   if [[ -x $XUI_BIN ]] && systemctl is-active -q x-ui; then
@@ -673,16 +731,19 @@ setup_xui() {
     fi
     wait $! 2>/dev/null || true
     [[ -x $XUI_BIN ]] || die "3x-ui 没装上"
+    fresh=1
   fi
 
-  # 面板登录信息:安装器写在 /etc/x-ui/install-result.env,挪进结果文件后删掉
-  if [[ -f /etc/x-ui/install-result.env ]]; then
-    xu=$(set +u; . /etc/x-ui/install-result.env; printf '%s' "${XUI_USERNAME:-}")
-    xp=$(set +u; . /etc/x-ui/install-result.env; printf '%s' "${XUI_PASSWORD:-}")
+  # 面板登录信息:安装器写在 $XUI_RESULT(保留不删),抄一份进结果文件。
+  # 只在刚装完、或结果文件里还没有时抄:以后在面板里改了密码,重新执行不会用旧值盖掉
+  if [[ -f $XUI_RESULT ]] && [[ $fresh == 1 || -z $(result_get PANEL_PASSWORD) ]]; then
+    # shellcheck disable=SC1090
+    xu=$(set +u; . "$XUI_RESULT"; printf '%s' "${XUI_USERNAME:-}")
+    # shellcheck disable=SC1090
+    xp=$(set +u; . "$XUI_RESULT"; printf '%s' "${XUI_PASSWORD:-}")
     [[ -z $xu ]] || result_set PANEL_USERNAME "$xu"
     [[ -z $xp ]] || result_set PANEL_PASSWORD "$xp"
     unset xu xp
-    rm -f /etc/x-ui/install-result.env
   fi
   WBP=$($XUI_BIN setting -show 2>/dev/null | sed -n 's/^webBasePath: *//p' | tr -d '/[:space:]')
   [[ -n $WBP ]] || die "读不到面板的 webBasePath"
@@ -707,13 +768,7 @@ setup_xui() {
   systemctl restart x-ui
   wait_api
 
-  # 安装器自己留的 install token 删掉,只留 xui-node 这一个
-  if tokens=$(api GET /setting/apiTokens 2>/dev/null); then
-    for id in $(jq -r '.[]? | select(.name == "install") | .id' <<<"$tokens"); do
-      api POST "/setting/apiTokens/delete/$id" >/dev/null 2>&1 ||
-        warn "删安装器留下的 token 失败(不影响使用,可在面板设置 → API Tokens 里删)"
-    done
-  fi
+  # 安装器自己生成的 install token 保留($XUI_RESULT 里记的就是它)
 
   # 订阅备注模板 {{INBOUND}};关掉 3x-ui 自带的订阅服务,并把它的端口挪开
   # (它默认占 2096;面板不允许订阅端口和面板端口相同,关着也不行,否则以后在面板里保存设置会失败)
@@ -738,6 +793,13 @@ setup_xui() {
   fi
   who=$(port_owner "$PANEL_PORT")
   [[ $who =~ \"x-ui\" ]] || die "面板没在 $PANEL_PORT 端口监听(${who:-没有程序在听})"
+
+  # 安装器的结果文件保留,但里面的端口和地址(临时端口、http、IP)变了:改成现在的值,照着它也能连上。
+  # token 不动(install token 没删,照样能用)
+  if [[ -f $XUI_RESULT ]]; then
+    env_set "$XUI_RESULT" XUI_PANEL_PORT "$PANEL_PORT"
+    env_set "$XUI_RESULT" XUI_ACCESS_URL "https://${DOMAIN}:${PANEL_PORT}/${WBP}"
+  fi
   ok "面板在 $PANEL_PORT 端口(HTTPS,证书 $DOMAIN)"
 }
 
@@ -1039,6 +1101,7 @@ cmd_install() {
   setup_deps
   recheck_ports
   precheck_existing
+  setup_bbr
   result_set XUI_NODE_VERSION "$XUI_NODE_VERSION"
   result_set DOMAIN "$DOMAIN"
   result_set PUBLIC_IP "$PUBLIC_IP"
@@ -1062,6 +1125,9 @@ cmd_install() {
   show_plan
   printf '\n'
   info "面板地址、登录账号和 API token 保存在 $RESULT(只有 root 可读,安装过程中没有打印)。"
+  if [[ -f $XUI_RESULT ]]; then
+    info "3x-ui 安装器自己的 $XUI_RESULT 也保留了,里面的端口和地址已改成现在的。"
+  fi
   info "查看:xui-node info        管理菜单:xui-node"
   info "下一步:登录面板,在 $REALITY_PORT 端口的入站里添加用户;或者把面板地址和 token 交给管理程序。"
 }
@@ -1109,6 +1175,7 @@ cmd_status() {
   if [[ ${XRAY_VERSION:-keep} == keep ]]; then pin="不锁定"; else pin="$XRAY_VERSION,定时检查$(unit_state "$PIN_UNIT.timer")"; fi
   info "版本锁定:$pin"
   info "Nginx 站点:$(unit_state nginx)"
+  info "拥塞控制:$(bbr_state)"
   if [[ -f /etc/letsencrypt/live/$DOMAIN/cert.pem ]]; then
     end=$(openssl x509 -enddate -noout -in "/etc/letsencrypt/live/$DOMAIN/cert.pem" 2>/dev/null | cut -d= -f2 || true)
   fi
