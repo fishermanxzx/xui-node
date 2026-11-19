@@ -16,7 +16,7 @@
 set -Eeuo pipefail
 umask 022
 
-XUI_NODE_VERSION=1.1.0
+XUI_NODE_VERSION=1.2.0
 REPO=fishermanxzx/xui-node
 RAW_URL="https://raw.githubusercontent.com/${REPO}/${XUI_NODE_REF:-main}"
 
@@ -44,7 +44,8 @@ SOCKS_REMARK=socks
 DEFAULT_PANEL_PORT=2096
 DEFAULT_REALITY_PORT=443
 DEFAULT_SOCKS_PORT=10001
-DEFAULT_XRAY=v26.6.27
+# keep = 用 3x-ui 自带的 Xray,不锁定
+DEFAULT_XRAY=keep
 # 开防火墙后等你确认 SSH 还能登录的秒数,超时自动撤销
 FW_CONFIRM_SECONDS=120
 APT=(apt-get -o DPkg::Lock::Timeout=600)
@@ -209,7 +210,7 @@ usage_install() {
   --reality-port N         Reality 入站端口(默认 ${DEFAULT_REALITY_PORT})
   --socks-port N           SOCKS5 端口,防火墙放行;0 = 不预留(默认 ${DEFAULT_SOCKS_PORT})
   --socks-inbound          在 SOCKS5 端口建好入站(账号密码认证,支持 UDP);不加就只预留端口,以后可以执行 xui-node socks
-  --xray-version vX.Y.Z    锁定的 Xray 内核版本(默认 ${DEFAULT_XRAY});keep = 用 3x-ui 自带的、不锁定
+  --xray-version vX.Y.Z    锁定 Xray 内核版本(通过 3x-ui 接口切换,每 10 分钟检查);默认 keep = 用 3x-ui 自带的、不锁定
   --xui-version vX.Y.Z     3x-ui 版本(默认最新 release)
   --no-firewall            不启用本脚本的防火墙
   --ssh-port N[,N]         防火墙放行的 SSH 端口(默认自动识别:sshd 配置、实际监听、ssh.socket、当前连接,再加上次的)
@@ -302,7 +303,7 @@ v_domain() { is_domain "$1" || { warn "不是有效的域名,例如 us1.example.
 v_panel_port() { check_port PANEL_PORT "$1"; }
 v_reality_port() { check_port REALITY_PORT "$1"; }
 v_socks_port() { check_port SOCKS_PORT "$1"; }
-v_xray() { [[ $1 == keep || $1 =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]] || { warn "写成 v26.6.27 这样,或者 keep"; return 1; }; }
+v_xray() { [[ $1 == keep || $1 =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]] || { warn "写成 v26.11.9 这样,或者 keep"; return 1; }; }
 v_email() { [[ $1 =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]] || { warn "邮箱格式不对"; return 1; }; }
 v_ssh_ports() {
   local p name o
@@ -503,8 +504,8 @@ wizard() {
   fi
 
   ask_title 5 "Xray 内核版本"
-  hint "通过 3x-ui 接口切换,之后每 10 分钟检查一次,被面板或 3x-ui 升级换掉了就自动换回。"
-  hint "填 keep 就用 3x-ui 自带的版本,不锁定。"
+  hint "默认 keep:用 3x-ui 自带的版本,不锁定,3x-ui 升级时跟着升。"
+  hint "要锁定就填版本号(例如 v26.11.9):通过 3x-ui 接口切换,之后每 10 分钟检查一次,被换掉了就自动换回。"
   ask XRAY_VERSION "Xray 版本" "$XRAY_VERSION" v_xray
 
   ask_title 6 "防火墙"
@@ -1492,7 +1493,11 @@ cmd_xray_pin() {
   need_root
   [[ -f $RESULT ]] || return 0
   load_result
-  [[ ${XRAY_VERSION:-keep} != keep && -n ${PANEL_TOKEN:-} ]] || return 0
+  if [[ ${XRAY_VERSION:-keep} == keep ]]; then
+    [[ ! -t 1 ]] || info "没锁定 Xray 版本(用 3x-ui 自带的);要锁定就重新安装时填版本号"
+    return 0
+  fi
+  [[ -n ${PANEL_TOKEN:-} ]] || return 0
   api_from_result
   want=${XRAY_VERSION#v}
   cur=$(api GET /server/status | jq -r '.xray.version // empty') || return 1
