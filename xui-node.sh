@@ -8,6 +8,7 @@
 #   xui-node info               面板地址、登录账号、API token(会显示密码)
 #   xui-node status             运行状态
 #   xui-node fw [show|apply]    防火墙规则
+#   xui-node socks [--rotate]   SOCKS5 入站:建好(或沿用已有的),地址写进结果文件;--rotate 换密码
 #   xui-node xray-pin           检查 Xray 内核版本,不对就换回(定时器每 10 分钟跑一次)
 #   xui-node update             更新本脚本
 #   xui-node help               帮助
@@ -15,7 +16,7 @@
 set -Eeuo pipefail
 umask 022
 
-XUI_NODE_VERSION=1.0.2
+XUI_NODE_VERSION=1.1.0
 REPO=fishermanxzx/xui-node
 RAW_URL="https://raw.githubusercontent.com/${REPO}/${XUI_NODE_REF:-main}"
 
@@ -39,6 +40,7 @@ RENEW_HOOK=/etc/letsencrypt/renewal-hooks/deploy/xui-node.sh
 # Nginx 真站点只听 127.0.0.1 的这个端口,给 Reality 当伪装目标
 SITE_PORT=8443
 TOKEN_NAME=xui-node
+SOCKS_REMARK=socks
 DEFAULT_PANEL_PORT=2096
 DEFAULT_REALITY_PORT=443
 DEFAULT_SOCKS_PORT=10001
@@ -205,7 +207,8 @@ usage_install() {
   --domain FQDN            本机域名(要先解析到本机 IP;Cloudflare 用灰云)
   --panel-port N           面板端口(默认 ${DEFAULT_PANEL_PORT})
   --reality-port N         Reality 入站端口(默认 ${DEFAULT_REALITY_PORT})
-  --socks-port N           防火墙给 SOCKS 预留的端口,0 = 不预留(默认 ${DEFAULT_SOCKS_PORT};只放行,不建入站)
+  --socks-port N           SOCKS5 端口,防火墙放行;0 = 不预留(默认 ${DEFAULT_SOCKS_PORT})
+  --socks-inbound          在 SOCKS5 端口建好入站(账号密码认证,支持 UDP);不加就只预留端口,以后可以执行 xui-node socks
   --xray-version vX.Y.Z    锁定的 Xray 内核版本(默认 ${DEFAULT_XRAY});keep = 用 3x-ui 自带的、不锁定
   --xui-version vX.Y.Z     3x-ui 版本(默认最新 release)
   --no-firewall            不启用本脚本的防火墙
@@ -289,8 +292,8 @@ check_port() {
     is_port "$o" || continue
     if [[ $((10#$o)) == "$p" ]]; then warn "和「${PORT_LABEL[$name]}」重了"; return 1; fi
   done
-  # SOCKS 端口只是预留,以后由上层在 3x-ui 里建入站;另外两个要现在就能用
-  if [[ $self != SOCKS_PORT ]]; then
+  # SOCKS 端口只预留(不建入站)时不查占用;要建入站或是另外两个端口,现在就得能用
+  if [[ $self != SOCKS_PORT || ${SOCKS_INBOUND:-0} == 1 ]]; then
     w=$(port_owner "$p")
     if [[ -n $w && ! $w =~ \"(xray-linux[^\"]*|x-ui)\" ]]; then warn "端口 $p 被别的程序占用:${w%%$'\n'*}"; return 1; fi
   fi
@@ -329,6 +332,7 @@ validate_inputs() {
   v_panel_port "$PANEL_PORT" || die "面板端口 $PANEL_PORT 不能用"
   v_reality_port "$REALITY_PORT" || die "Reality 端口 $REALITY_PORT 不能用"
   v_socks_port "$SOCKS_PORT" || die "SOCKS 端口 $SOCKS_PORT 不能用"
+  [[ $SOCKS_INBOUND == 0 || $((10#$SOCKS_PORT)) != 0 ]] || die "要建 SOCKS5 入站(--socks-inbound),SOCKS 端口就不能是 0"
   v_xray "$XRAY_VERSION" || die "Xray 版本 $XRAY_VERSION 不对"
   [[ $XRAY_VERSION == keep || $XRAY_VERSION == v* ]] || XRAY_VERSION=v$XRAY_VERSION
   [[ $XUI_VERSION == latest || $XUI_VERSION =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "--xui-version 要写成 latest 或 v3.11.0 这样"
@@ -350,6 +354,7 @@ recheck_ports() {
   [[ -z $w || $w =~ \"nginx\" ]] || die "80 端口被别的程序占用(签证书要用):${w%%$'\n'*}"
   v_panel_port "$PANEL_PORT" || die "面板端口 $PANEL_PORT 不能用"
   v_reality_port "$REALITY_PORT" || die "Reality 端口 $REALITY_PORT 不能用"
+  if [[ $SOCKS_INBOUND == 1 ]]; then v_socks_port "$SOCKS_PORT" || die "SOCKS 端口 $SOCKS_PORT 不能用"; fi
 }
 
 # 本机上本脚本建的 Reality 入站(target 指向本机站点的 vless)要和这次的端口、域名对得上;对不上就停下,什么都不改。
@@ -375,6 +380,18 @@ check_reality() {
   REALITY_EXISTS=1
 }
 
+# SOCKS 端口上已有的入站(JSON;没有就输出空)
+socks_inbound_on() { jq -c --argjson p "$SOCKS_PORT" '[.[]? | select(.port == $p)][0] // empty' <<<"$1"; }
+# SOCKS 端口上已经有别的协议的入站就停下
+socks_check_conflict() {
+  local ib proto
+  ib=$(socks_inbound_on "$1")
+  [[ -n $ib ]] || return 0
+  proto=$(jq -r '.protocol // ""' <<<"$ib")
+  [[ $proto == mixed || $proto == socks ]] ||
+    die "面板上 $SOCKS_PORT 端口已经有入站 $(jq -r '.remark // ""' <<<"$ib")($proto),不是 SOCKS。换个 SOCKS 端口(xui-node install --socks-port N),或者先在面板里删掉它"
+}
+
 # 重新安装前:用上次的面板信息读已有入站,端口 / 域名对不上就在改任何东西之前停下
 precheck_existing() {
   local token domain port wbp inbounds
@@ -391,6 +408,7 @@ precheck_existing() {
     return 0
   fi
   check_reality "$inbounds"
+  if [[ $SOCKS_INBOUND == 1 ]]; then socks_check_conflict "$inbounds"; fi
 }
 
 # ---------------- 安装:向导 ----------------
@@ -470,9 +488,19 @@ wizard() {
   hint "VLESS + Reality 入站,所有用户共用这一个端口。没通过 Reality 认证的访问看到的是本机的真站点。"
   ask REALITY_PORT "Reality 端口" "$REALITY_PORT" v_reality_port
 
-  ask_title 4 "SOCKS 预留端口"
-  hint "只在防火墙放行,不建入站;留给管理程序以后在 3x-ui 里建 SOCKS 用。填 0 不预留。"
+  ask_title 4 "SOCKS5"
+  hint "给 SOCKS5 预留一个端口(防火墙放行)。可以现在就在这个端口建好 SOCKS5 入站(账号密码认证,支持 UDP),"
+  hint "任何支持 SOCKS5 的程序都能用它当代理;也可以先只预留,以后执行 xui-node socks 再建。填 0 不预留。"
   ask SOCKS_PORT "SOCKS 端口" "$SOCKS_PORT" v_socks_port
+  if [[ $((10#$SOCKS_PORT)) == 0 ]]; then
+    SOCKS_INBOUND=0
+  elif ask_yn "现在建 SOCKS5 入站" "$([[ $SOCKS_INBOUND == 1 ]] && echo y || echo n)"; then
+    SOCKS_INBOUND=1
+    until v_socks_port "$SOCKS_PORT"; do ask SOCKS_PORT "SOCKS 端口" "" v_socks_port; done
+    if [[ $((10#$SOCKS_PORT)) == 0 ]]; then SOCKS_INBOUND=0; fi
+  else
+    SOCKS_INBOUND=0
+  fi
 
   ask_title 5 "Xray 内核版本"
   hint "通过 3x-ui 接口切换,之后每 10 分钟检查一次,被面板或 3x-ui 升级换掉了就自动换回。"
@@ -496,6 +524,33 @@ fw_open_ports() {
   words "$p"
 }
 
+# 系统临时端口段(ip_local_port_range),输出 起-止
+ephemeral_range() {
+  local lo="" hi=""
+  if [[ -r /proc/sys/net/ipv4/ip_local_port_range ]]; then read -r lo hi </proc/sys/net/ipv4/ip_local_port_range || true; fi
+  if is_port "$lo" && is_port "$hi" && ((lo <= hi)); then echo "$lo-$hi"; else echo "32768-60999"; fi
+}
+# 建了 SOCKS5 入站时要放行的 UDP:新版 Xray 每次 UDP ASSOCIATE 都另开一个系统临时端口收发 UDP,
+# 不走 SOCKS 端口本身(老版本走),所以两样都放行。Xray 只收发起认证的那个 IP 发来的包。
+fw_open_udp() {
+  local r lo hi p=$((10#${SOCKS_PORT:-0}))
+  [[ $p != 0 && ${SOCKS_INBOUND:-0} == 1 ]] || return 0
+  r=$(ephemeral_range)
+  lo=${r%-*} hi=${r#*-}
+  if ((p >= lo && p <= hi)); then
+    echo "$r"
+  elif ((p < lo)); then
+    echo "$p $r"
+  else
+    echo "$r $p"
+  fi
+}
+# 防火墙放行端口的说明:fw_desc TCP端口 [UDP端口]
+fw_desc() {
+  printf 'TCP %s' "$(sed 's/ /, /g' <<<"$1")"
+  [[ -z ${2:-} ]] || printf ';UDP %s(SOCKS5 的 UDP)' "$(sed 's/ /, /g' <<<"$2")"
+}
+
 show_plan() {
   local extra
   printf '\n'
@@ -503,12 +558,18 @@ show_plan() {
   info "公网 IP       $PUBLIC_IP"
   info "面板端口      $PANEL_PORT(HTTPS)"
   info "Reality 端口  $REALITY_PORT(伪装目标 127.0.0.1:$SITE_PORT 上的本机站点,SNI $DOMAIN)"
-  if [[ $SOCKS_PORT == 0 ]]; then info "SOCKS 预留    不预留"; else info "SOCKS 预留    $SOCKS_PORT(只放行,不建入站)"; fi
+  if [[ $SOCKS_PORT == 0 ]]; then
+    info "SOCKS5        不预留端口"
+  elif [[ $SOCKS_INBOUND == 1 ]]; then
+    info "SOCKS5        $SOCKS_PORT 端口,建入站(账号密码认证,支持 UDP)"
+  else
+    info "SOCKS5        预留 $SOCKS_PORT 端口(只放行,不建入站;以后可以执行 xui-node socks)"
+  fi
   if [[ $XRAY_VERSION == keep ]]; then info "Xray 内核     3x-ui 自带的版本,不锁定"; else info "Xray 内核     $XRAY_VERSION(锁定)"; fi
   info "BBR           $BBR_NOTE"
   if [[ $FIREWALL == 1 ]]; then
     extra=$(fw_conf_get EXTRA_PORTS)
-    info "防火墙        放行 TCP $(words "$SSH_PORTS $(fw_open_ports) $extra" | sed 's/ /, /g'),其余丢弃(SSH:$(words "$SSH_PORTS" | sed 's/ /, /g'))"
+    info "防火墙        放行 $(fw_desc "$(words "$SSH_PORTS $(fw_open_ports) $extra")" "$(fw_open_udp)"),其余丢弃(SSH:$(words "$SSH_PORTS" | sed 's/ /, /g'))"
   else
     info "防火墙        不启用"
   fi
@@ -887,6 +948,147 @@ setup_inbound() {
   ok "已新建(备注 $REMARK,还没有用户)"
 }
 
+# ---------------- SOCKS5 入站 ----------------
+# 确保 SOCKS_PORT 上有一个带账号密码的 SOCKS5(mixed)入站,地址写进结果文件的 SOCKS_URL。
+# 已有就沿用,账号密码不变(只把 UDP 设置补对、停用的启用);rotate=1 时换密码。
+# 账号密码只经过环境变量(只有 root 能看)和标准输入,不出现在命令行里,也不打印。
+SOCKS_ROTATED=0
+socks_ensure() {
+  local rotate=$1 list ib proto id settings listen w body user pass fixes=()
+  list=$(api GET /inbounds/list) || die "读不到面板上的入站"
+  ib=$(socks_inbound_on "$list")
+  unset list
+  if [[ -z $ib ]]; then
+    w=$(port_owner "$SOCKS_PORT")
+    [[ -z $w || $w =~ \"(xray-linux[^\"]*|x-ui)\" ]] || die "端口 $SOCKS_PORT 被别的程序占用:${w%%$'\n'*}"
+    user=$(rand_hex 4)
+    pass=$(rand_hex 16)
+    # ip 填 0.0.0.0:Xray 在所有地址上开临时 UDP 端口,UDP ASSOCIATE 的回复里地址是 0.0.0.0,
+    # 客户端按惯例改用它连过来的地址发 UDP(Xray 的 SOCKS 出站就是这样),NAT 后的机器也能用。
+    # 填公网 IP 在 NAT 后的机器上会绑不上;填 127.0.0.1 外面的客户端发不过来
+    body=$(S_USER=$user S_PASS=$pass jq -nc --arg remark "$SOCKS_REMARK" --argjson port "$SOCKS_PORT" '{
+      up: 0, down: 0, total: 0, remark: $remark, enable: true, expiryTime: 0, listen: "", port: $port, protocol: "mixed",
+      settings: ({ auth: "password", accounts: [{ user: env.S_USER, pass: env.S_PASS }], udp: true, ip: "0.0.0.0" } | tojson),
+      streamSettings: ({ network: "tcp", security: "none", tcpSettings: { acceptProxyProtocol: false, header: { type: "none" } } } | tojson),
+      sniffing: ({ enabled: false, destOverride: ["http", "tls", "quic", "fakedns"], metadataOnly: false, routeOnly: false } | tojson)
+    }')
+    api POST /inbounds/add "$body" >/dev/null || die "新建 SOCKS5 入站失败"
+    ok "已新建 SOCKS5 入站(端口 $SOCKS_PORT,备注 $SOCKS_REMARK,账号密码随机生成)"
+  else
+    proto=$(jq -r '.protocol // ""' <<<"$ib")
+    [[ $proto == mixed || $proto == socks ]] ||
+      die "面板上 $SOCKS_PORT 端口已经有入站 $(jq -r '.remark // ""' <<<"$ib")($proto),不是 SOCKS。换个 SOCKS 端口(xui-node install --socks-port N),或者先在面板里删掉它"
+    id=$(jq -r '.id' <<<"$ib")
+    settings=$(jq -c '.settings | if type == "string" then (fromjson? // {}) elif type == "object" then . else {} end' <<<"$ib")
+    user=$(jq -r '.accounts[0].user // ""' <<<"$settings")
+    pass=$(jq -r '.accounts[0].pass // ""' <<<"$settings")
+    if [[ $(jq -r '.auth // ""' <<<"$settings") != password || -z $user || -z $pass ]]; then
+      [[ $rotate == 1 ]] ||
+        die "面板上 $SOCKS_PORT 端口的 SOCKS 入站没设账号密码(谁都能用)。执行 xui-node socks --rotate 给它设上(原来不用密码连它的程序要跟着改),或者先在面板里删掉它"
+      [[ -n $user ]] || user=$(rand_hex 4)
+      fixes+=("原来没设账号密码,已设上")
+    elif [[ $rotate == 1 ]]; then
+      fixes+=("换了密码")
+    fi
+    if [[ $rotate == 1 ]]; then
+      pass=$(rand_hex 16)
+      SOCKS_ROTATED=1
+    fi
+    if [[ $(jq -r '"\(.udp)|\(.ip // "")"' <<<"$settings") != "true|0.0.0.0" ]]; then fixes+=("UDP 设置改成 udp 开、ip 0.0.0.0"); fi
+    if ((${#fixes[@]})); then
+      # update 接口不改启用状态(用 setEnable),也不碰 settings.clients;tag 原样带上,面板自己决定要不要重新生成
+      body=$(S_USER=$user S_PASS=$pass S_ROTATE=$rotate jq -c '{ remark, listen, port, protocol, expiryTime, total, tag, streamSettings, sniffing }
+        + { settings: ((.settings | if type == "string" then (fromjson? // {}) elif type == "object" then . else {} end)
+          | .udp = true | .ip = "0.0.0.0"
+          | if env.S_ROTATE == "1" then .auth = "password" | .accounts = ([{ user: env.S_USER, pass: env.S_PASS }] + ((.accounts // [])[1:])) else . end
+          | tojson) }' <<<"$ib")
+      api POST "/inbounds/update/$id" "$body" >/dev/null || die "修改 SOCKS5 入站失败"
+    fi
+    if [[ $(jq -r '.enable' <<<"$ib") != true ]]; then
+      api POST "/inbounds/setEnable/$id" '{"enable":true}' >/dev/null || die "启用 SOCKS5 入站失败"
+      fixes+=("原来是停用的,已启用")
+    fi
+    listen=$(jq -r '.listen // ""' <<<"$ib")
+    if [[ -n $listen && $listen != 0.0.0.0 && $listen != :: ]]; then
+      warn "这个入站只监听 $listen,别的机器连不上;要对外用就在面板里把它的监听地址清空"
+    fi
+    if ((${#fixes[@]})); then
+      ok "沿用 $SOCKS_PORT 端口已有的 SOCKS 入站:$(printf '%s;' "${fixes[@]}" | sed 's/;$//')"
+    else
+      ok "沿用 $SOCKS_PORT 端口已有的 SOCKS 入站,账号密码不变"
+    fi
+  fi
+  result_set SOCKS_URL "$(S_USER=$user S_PASS=$pass jq -rn --arg h "$DOMAIN" --arg p "$SOCKS_PORT" '"socks5://\(env.S_USER | @uri):\(env.S_PASS | @uri)@\($h):\($p)"')"
+  unset ib settings body user pass
+}
+
+# 本机经 SOCKS5 访问一次外网(账号密码经标准输入交给 curl,不出现在命令行里)
+socks_selftest() {
+  local url
+  url=$(result_get SOCKS_URL)
+  url=${url%@*}@127.0.0.1:$SOCKS_PORT
+  printf 'proxy = "%s"\n' "${url/#socks5:/socks5h:}" |
+    curl -K - -fsS --max-time 15 -o /dev/null https://1.1.1.1/cdn-cgi/trace 2>/dev/null
+}
+# 等 SOCKS5 入站生效(面板一般直接热加载,不行会自己排一次重启)并自查;一直不通就重启一次 Xray 再试
+socks_verify() {
+  local round
+  for round in 1 2; do
+    for _ in $(seq 1 15); do
+      if [[ -n $(port_owner "$SOCKS_PORT") ]] && socks_selftest; then
+        ok "SOCKS5 自查通过:本机用这个账号密码经 $SOCKS_PORT 端口访问外网正常"
+        return 0
+      fi
+      sleep 2
+    done
+    [[ $round == 1 ]] || break
+    info "还没生效,重启一次 Xray 再试"
+    api POST /server/restartXrayService >/dev/null 2>&1 || true
+  done
+  if [[ -z $(port_owner "$SOCKS_PORT") ]]; then
+    warn "$SOCKS_PORT 端口没在监听,看看面板里这个入站和 Xray 日志"
+  else
+    warn "本机经 SOCKS5 访问外网没通过(端口在监听),看看面板里这个入站和 Xray 日志"
+  fi
+  return 1
+}
+
+# 安装时:要建就建(或沿用)。没要建,但端口上已经有带账号密码的 SOCKS 入站,也照样沿用(脚本不删入站)
+setup_socks() {
+  local list ib old
+  old=$(result_get SOCKS_URL)
+  if [[ $SOCKS_PORT == 0 ]]; then
+    if [[ -n $old ]]; then
+      warn "原来的 SOCKS5 入站还在面板里(${old##*:} 端口),SOCKS 端口设成 0 后防火墙不再放行它;不用了就在面板里删掉"
+      result_set SOCKS_URL ""
+    fi
+    return 0
+  fi
+  list=$(api GET /inbounds/list) || die "读不到面板上的入站"
+  ib=$(socks_inbound_on "$list")
+  unset list
+  if [[ $SOCKS_INBOUND != 1 ]]; then
+    if [[ -z $ib ]] || ! jq -e '(.protocol == "mixed" or .protocol == "socks")
+      and ((.settings | if type == "string" then (fromjson? // {}) elif type == "object" then . else {} end)
+        | .auth == "password" and ((.accounts // [])[0].pass // "") != "")' >/dev/null <<<"$ib"; then
+      [[ -z $old ]] || result_set SOCKS_URL ""
+      return 0
+    fi
+    SOCKS_INBOUND=1
+  fi
+  step "SOCKS5 入站(端口 $SOCKS_PORT)"
+  if [[ -n $old && ${old##*:} != "$SOCKS_PORT" ]]; then
+    warn "原来的 SOCKS5 入站在 ${old##*:} 端口,还在面板里,防火墙不再放行它;不用了就在面板里删掉"
+  fi
+  unset ib
+  socks_ensure 0
+  info "地址(socks5://用户:密码@${DOMAIN}:${SOCKS_PORT})写在 $RESULT 的 SOCKS_URL,用 xui-node info 查看"
+  socks_hint_sg
+}
+socks_hint_sg() {
+  hint "服务商如果有安全组 / 云防火墙,要放行 TCP $SOCKS_PORT 和 UDP $(fw_open_udp | sed 's/ /, /g')(UDP 走系统临时端口)。"
+}
+
 final_check() {
   local st="" page
   step "重启 Xray 并核对"
@@ -907,23 +1109,26 @@ final_check() {
   page=$(curl -fsS --max-time 10 --resolve "$DOMAIN:${REALITY_PORT}:127.0.0.1" "https://$DOMAIN:${REALITY_PORT}/" 2>/dev/null || true)
   [[ $page == *'<title>'* ]] || die "从 $REALITY_PORT 端口访问 https://$DOMAIN 没看到站点(Reality 伪装目标不通?)"
   ok "Xray ${st%%|*} 在运行;$REALITY_PORT 端口没认证的访问看到的是 $DOMAIN 的站点"
+  if [[ $SOCKS_INBOUND == 1 ]]; then socks_verify || true; fi
 }
 
 # ---------------- 防火墙 ----------------
-fw_write_conf() { # fw_write_conf SSH端口 本脚本管的端口 额外端口
+fw_write_conf() { # fw_write_conf SSH端口 本脚本管的端口 额外端口 本脚本管的UDP端口
   cat >"$FW_CONF" <<EOF
 # xui-node 防火墙配置,改完执行 xui-node fw apply
 # SSH_PORTS:SSH 端口(每次 apply 都会把自动识别到的并进来,不会少)
-# OPEN_PORTS:本脚本管的端口(重新安装时按设置重写)
+# OPEN_PORTS:本脚本管的 TCP 端口(重新安装时按设置重写)
+# OPEN_UDP:本脚本管的 UDP 端口(建了 SOCKS5 入站才有:SOCKS 端口 + 系统临时端口段)
 # EXTRA_PORTS:你自己要额外放行的 TCP 端口(重新安装时保留)
 SSH_PORTS=$(printf '%q' "$1")
 OPEN_PORTS=$(printf '%q' "$2")
+OPEN_UDP=$(printf '%q' "${4:-}")
 EXTRA_PORTS=$(printf '%q' "$3")
 EOF
   chmod 600 "$FW_CONF"
 }
 
-fw_render() { # fw_render 放行的端口
+fw_render() { # fw_render 放行的TCP端口 [放行的UDP端口(可以是 起-止)]
   cat <<EOF
 table inet ${FW_TABLE}
 delete table inet ${FW_TABLE}
@@ -937,9 +1142,9 @@ table inet ${FW_TABLE} {
     meta l4proto ipv6-icmp accept
     udp dport { 68, 546 } accept
     tcp dport { $(words "$1" | sed 's/ /, /g') } accept
-  }
-}
 EOF
+  [[ -z ${2:-} ]] || printf '    udp dport { %s } accept\n' "$(sed 's/ /, /g' <<<"$2")"
+  printf '  }\n}\n'
 }
 
 fw_revert() {
@@ -950,23 +1155,24 @@ fw_revert() {
 
 # 按配置生成规则并生效。confirm=1:生效后请人新开 SSH 确认,超时自动撤销(人不在了也由定时器撤销)
 fw_apply() {
-  local confirm=${1:-0} ssh open extra tmp ports
+  local confirm=${1:-0} ssh open extra udp tmp ports
   [[ -f $FW_CONF ]] || die "没有 $FW_CONF(防火墙没启用,用 xui-node install 开)"
   ssh=$(words "$(fw_conf_get SSH_PORTS) $(detect_ssh_ports)")
   open=$(fw_conf_get OPEN_PORTS)
   extra=$(fw_conf_get EXTRA_PORTS)
+  udp=$(fw_conf_get OPEN_UDP | xargs)
   [[ -n $ssh ]] || die "识别不到 SSH 端口,$FW_CONF 里也没有:不应用(免得把自己关在外面)"
-  fw_write_conf "$ssh" "$open" "$extra"
+  fw_write_conf "$ssh" "$open" "$extra" "$udp"
   ports=$(words "$ssh $open $extra")
   tmp=$(mktemp "$STATE_DIR/.fw.XXXXXX")
-  fw_render "$ports" >"$tmp"
+  fw_render "$ports" "$udp" >"$tmp"
   nft -c -f "$tmp" || { rm -f "$tmp"; die "规则检查没通过"; }
   # 开机自动加载(没确认被撤销时会再关掉)
   systemctl daemon-reload
   systemctl enable "$FW_UNIT" >/dev/null 2>&1
   if nft list table inet "$FW_TABLE" >/dev/null 2>&1 && cmp -s "$tmp" "$FW_RULES"; then
     rm -f "$tmp"
-    ok "防火墙规则没变:放行 TCP $(sed 's/ /, /g' <<<"$ports")"
+    ok "防火墙规则没变:放行 $(fw_desc "$ports" "$udp")"
     return 0
   fi
   mv "$tmp" "$FW_RULES"
@@ -978,7 +1184,7 @@ fw_apply() {
       warn "排不上自动撤销的定时器,确认时请别断开当前连接"
   fi
   nft -f "$FW_RULES"
-  ok "防火墙已生效:放行 TCP $(sed 's/ /, /g' <<<"$ports")(SSH:$(sed 's/ /, /g' <<<"$ssh"))"
+  ok "防火墙已生效:放行 $(fw_desc "$ports" "$udp")(SSH:$(sed 's/ /, /g' <<<"$ssh"))"
   [[ $confirm == 1 ]] || return 0
   printf '\n'
   info "现在新开一个终端,用 SSH 登录这台机器试试(当前这个连接不受影响)。"
@@ -1009,7 +1215,7 @@ setup_firewall() {
   fi
   install -d -m 700 "$STATE_DIR"
   extra=$(fw_conf_get EXTRA_PORTS)
-  fw_write_conf "$SSH_PORTS" "$(fw_open_ports)" "$extra"
+  fw_write_conf "$SSH_PORTS" "$(fw_open_ports)" "$extra" "$(fw_open_udp)"
   # 不用默认依赖:跟 Debian 自带的 nftables.service 一样,免得开机时和 cloud-init / 网络服务排成环
   cat >"/etc/systemd/system/$FW_UNIT" <<EOF
 [Unit]
@@ -1039,7 +1245,7 @@ EOF
 INTERACTIVE=0
 cmd_install() {
   local yes=0 prev_ssh
-  DOMAIN="" PANEL_PORT="" REALITY_PORT="" SOCKS_PORT="" XRAY_VERSION="" XUI_VERSION=latest
+  DOMAIN="" PANEL_PORT="" REALITY_PORT="" SOCKS_PORT="" SOCKS_INBOUND="" XRAY_VERSION="" XUI_VERSION=latest
   SSH_PORTS="" FIREWALL="" REMARK="" PUBLIC_IP="" ACME_EMAIL="" SKIP_DNS_CHECK=0 CERT_DIR=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -1047,6 +1253,7 @@ cmd_install() {
       --panel-port) need_arg "$@"; PANEL_PORT=$2; shift 2 ;;
       --reality-port) need_arg "$@"; REALITY_PORT=$2; shift 2 ;;
       --socks-port) need_arg "$@"; SOCKS_PORT=$2; shift 2 ;;
+      --socks-inbound) SOCKS_INBOUND=1; shift ;;
       --xray-version) need_arg "$@"; XRAY_VERSION=$2; shift 2 ;;
       --xui-version) need_arg "$@"; XUI_VERSION=$2; shift 2 ;;
       --ssh-port) need_arg "$@"; SSH_PORTS=$2; shift 2 ;;
@@ -1077,6 +1284,10 @@ cmd_install() {
   PANEL_PORT=${PANEL_PORT:-$DEFAULT_PANEL_PORT}
   REALITY_PORT=${REALITY_PORT:-$DEFAULT_REALITY_PORT}
   SOCKS_PORT=${SOCKS_PORT:-$DEFAULT_SOCKS_PORT}
+  # 上次建过 SOCKS5 入站,这次默认也要
+  if [[ -z $SOCKS_INBOUND ]]; then
+    if [[ -n $(result_get SOCKS_URL) ]]; then SOCKS_INBOUND=1; else SOCKS_INBOUND=0; fi
+  fi
   XRAY_VERSION=${XRAY_VERSION:-$DEFAULT_XRAY}
   FIREWALL=${FIREWALL:-1}
   # SSH 端口:没指定就把上次的、防火墙配置里的、自动识别的都并起来(只会多,不会把人关在外面)
@@ -1116,6 +1327,7 @@ cmd_install() {
   setup_xui
   setup_xray
   setup_inbound
+  setup_socks
   final_check
   # 防火墙最后上:前面哪步失败都不会动到它;在终端里装时生效后要确认 SSH 还能登录
   setup_firewall
@@ -1124,12 +1336,19 @@ cmd_install() {
   FIREWALL=$(result_get FIREWALL)
   show_plan
   printf '\n'
-  info "面板地址、登录账号和 API token 保存在 $RESULT(只有 root 可读,安装过程中没有打印)。"
+  if [[ $SOCKS_INBOUND == 1 ]]; then
+    info "面板地址、登录账号、API token 和 SOCKS5 地址保存在 $RESULT(只有 root 可读,安装过程中没有打印)。"
+  else
+    info "面板地址、登录账号和 API token 保存在 $RESULT(只有 root 可读,安装过程中没有打印)。"
+  fi
   if [[ -f $XUI_RESULT ]]; then
     info "3x-ui 安装器自己的 $XUI_RESULT 也保留了,里面的端口和地址已改成现在的。"
   fi
   info "查看:xui-node info        管理菜单:xui-node"
   info "下一步:登录面板,在 $REALITY_PORT 端口的入站里添加用户;或者把面板地址和 token 交给管理程序。"
+  if [[ $SOCKS_INBOUND != 1 && $SOCKS_PORT != 0 ]]; then
+    hint "要在 $SOCKS_PORT 端口建 SOCKS5 入站(账号密码认证,支持 UDP):xui-node socks"
+  fi
 }
 
 # 装好管理命令 /usr/local/bin/xui-node(从文件运行就复制自己,否则从 GitHub 下载)
@@ -1155,9 +1374,17 @@ cmd_info() {
   info "用户名          ${PANEL_USERNAME:-(不知道,用 x-ui 菜单重置)}"
   info "密码            ${PANEL_PASSWORD:-(不知道,用 x-ui 菜单重置)}"
   info "API token       ${PANEL_TOKEN:-?}"
+  if [[ -n ${SOCKS_URL:-} ]]; then
+    info "SOCKS5 地址     $SOCKS_URL"
+  elif [[ ${SOCKS_PORT:-0} != 0 ]]; then
+    info "SOCKS5          没建(预留了 $SOCKS_PORT 端口;要建就执行 xui-node socks)"
+  fi
   printf '\n'
   hint "账号密码是安装时生成的;在面板里改过就以面板为准。"
   hint "管理程序登记这台面板:地址用不带结尾 / 的 PANEL_URL,token 用 PANEL_TOKEN(都在 $RESULT)。"
+  if [[ -n ${SOCKS_URL:-} ]]; then
+    hint "SOCKS5 地址是 socks5://用户:密码@域名:端口 格式(结果文件里的 SOCKS_URL);在面板里改过账号密码的话,执行一次 xui-node socks 会按面板重新写。"
+  fi
 }
 
 cmd_status() {
@@ -1175,13 +1402,18 @@ cmd_status() {
   if [[ ${XRAY_VERSION:-keep} == keep ]]; then pin="不锁定"; else pin="$XRAY_VERSION,定时检查$(unit_state "$PIN_UNIT.timer")"; fi
   info "版本锁定:$pin"
   info "Nginx 站点:$(unit_state nginx)"
+  if [[ -n ${SOCKS_URL:-} ]]; then
+    info "SOCKS5:端口 $SOCKS_PORT$([[ -n $(port_owner "$SOCKS_PORT") ]] && echo ',在监听' || echo ',没在监听')"
+  elif [[ ${SOCKS_PORT:-0} != 0 ]]; then
+    info "SOCKS5:没建(预留了 $SOCKS_PORT 端口)"
+  fi
   info "拥塞控制:$(bbr_state)"
   if [[ -f /etc/letsencrypt/live/$DOMAIN/cert.pem ]]; then
     end=$(openssl x509 -enddate -noout -in "/etc/letsencrypt/live/$DOMAIN/cert.pem" 2>/dev/null | cut -d= -f2 || true)
   fi
   if [[ -n $end ]]; then info "证书:到期 $end"; else info "证书:没找到"; fi
   if nft list table inet "$FW_TABLE" >/dev/null 2>&1; then
-    info "防火墙:开,放行 TCP $(words "$(fw_conf_get SSH_PORTS) $(fw_conf_get OPEN_PORTS) $(fw_conf_get EXTRA_PORTS)" | sed 's/ /, /g')"
+    info "防火墙:开,放行 $(fw_desc "$(words "$(fw_conf_get SSH_PORTS) $(fw_conf_get OPEN_PORTS) $(fw_conf_get EXTRA_PORTS)")" "$(fw_conf_get OPEN_UDP | xargs)")"
   else
     info "防火墙:没开"
   fi
@@ -1203,6 +1435,56 @@ cmd_fw() {
       ;;
     *) die "用法: xui-node fw show|apply" ;;
   esac
+}
+
+usage_socks() {
+  cat <<EOF
+用法: xui-node socks [--rotate]
+
+在安装时预留的 SOCKS 端口上建一个 SOCKS5 入站:账号密码认证(随机生成),支持 UDP。
+任何支持 SOCKS5 的程序都能用它当代理。可以重复执行:端口上已经有 SOCKS 入站就沿用,账号密码不变。
+地址(socks5://用户:密码@域名:端口)写进 $RESULT 的 SOCKS_URL,用 xui-node info 查看,这里不打印。
+防火墙开着的话,会同时放行 SOCKS5 的 UDP(SOCKS 端口和系统临时端口段)。
+
+  --rotate     换一个新密码(用户名不变)。换了之后,所有用旧地址连这个 SOCKS5 的地方都要改成新地址。
+EOF
+}
+
+cmd_socks() {
+  local rotate=0 udp verified=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --rotate) rotate=1; shift ;;
+      -h | --help) usage_socks; return 0 ;;
+      *) die "未知参数: $1(xui-node socks --help 看用法)" ;;
+    esac
+  done
+  trap 'die "第 $LINENO 行出错(命令: $BASH_COMMAND)"' ERR
+  need_root
+  load_result
+  [[ -n ${PANEL_TOKEN:-} ]] || die "结果文件里没有面板 token,先执行 xui-node install"
+  SOCKS_PORT=$((10#${SOCKS_PORT:-0}))
+  [[ $SOCKS_PORT != 0 ]] ||
+    die "安装时没给 SOCKS 预留端口(设成了 0)。执行 xui-node install --socks-port ${DEFAULT_SOCKS_PORT} --socks-inbound 重新配置,会顺带建好"
+  api_from_result
+  api GET /server/status >/dev/null || die "面板接口连不上(本机 $PANEL_PORT 端口),先看 xui-node status"
+  step "SOCKS5 入站(端口 $SOCKS_PORT)"
+  socks_ensure "$rotate"
+  SOCKS_INBOUND=1
+  if [[ ${FIREWALL:-0} == 1 && -f $FW_CONF ]]; then
+    udp=$(fw_open_udp)
+    if [[ $(fw_conf_get OPEN_UDP | xargs) != "$udp" ]]; then
+      step "防火墙:放行 SOCKS5 的 UDP"
+      env_set "$FW_CONF" OPEN_UDP "$udp"
+      fw_apply 0
+    fi
+  fi
+  socks_verify && verified=1
+  printf '\n'
+  info "地址(socks5://用户:密码@${DOMAIN}:${SOCKS_PORT})写在 $RESULT 的 SOCKS_URL,用 xui-node info 查看。"
+  if [[ $SOCKS_ROTATED == 1 ]]; then warn "密码换了:所有用旧地址连这个 SOCKS5 的地方都要改成新地址"; fi
+  socks_hint_sg
+  [[ $verified == 1 ]] || exit 1
 }
 
 cmd_xray_pin() {
@@ -1250,26 +1532,28 @@ cmd_menu() {
     cat <<'EOF'
 
   1. 安装 / 重新配置
-  2. 面板地址、账号和 API token(会显示密码)
+  2. 面板地址、账号、API token 和 SOCKS5 地址(会显示密码)
   3. 运行状态
   4. 防火墙规则
-  5. 立即检查 Xray 版本锁定
-  6. 更新 xui-node
-  7. 打开 3x-ui 自带菜单(x-ui)
+  5. 建 SOCKS5 入站(已有就沿用)
+  6. 立即检查 Xray 版本锁定
+  7. 更新 xui-node
+  8. 打开 3x-ui 自带菜单(x-ui)
   0. 退出
 
 EOF
-    read -rp "请选择 [0-7]: " c || { echo; return 0; }
+    read -rp "请选择 [0-8]: " c || { echo; return 0; }
     case "$(trim "$c")" in
       1) bash "$self" install || true ;;
       2) bash "$self" info || true ;;
       3) bash "$self" status || true ;;
       4) bash "$self" fw show || true ;;
-      5) bash "$self" xray-pin || true ;;
-      6) if bash "$self" update; then exec "$BIN"; fi ;;
-      7) if command -v x-ui >/dev/null; then x-ui || true; else warn "还没装 3x-ui"; fi ;;
+      5) bash "$self" socks || true ;;
+      6) bash "$self" xray-pin || true ;;
+      7) if bash "$self" update; then exec "$BIN"; fi ;;
+      8) if command -v x-ui >/dev/null; then x-ui || true; else warn "还没装 3x-ui"; fi ;;
       0 | q) return 0 ;;
-      *) warn "请输入 0-7"; continue ;;
+      *) warn "请输入 0-8"; continue ;;
     esac
     read -rp "回车返回菜单..." c || return 0
   done
@@ -1284,6 +1568,7 @@ xui-node:把 Debian / Ubuntu VPS 装成 3x-ui 的 VLESS + Reality 节点
   xui-node info               面板地址、登录账号、API token(会显示密码)
   xui-node status             运行状态
   xui-node fw [show|apply]    防火墙规则
+  xui-node socks [--rotate]   SOCKS5 入站:建好(或沿用已有的),地址写进结果文件;--rotate 换密码
   xui-node xray-pin           检查 Xray 内核版本,不对就换回
   xui-node update             更新本脚本
   xui-node version            版本号
@@ -1297,6 +1582,7 @@ main() {
     info) cmd_info ;;
     status) cmd_status ;;
     fw | firewall) cmd_fw "${2:-show}" ;;
+    socks) shift; cmd_socks "$@" ;;
     xray-pin) cmd_xray_pin ;;
     update) cmd_update ;;
     version | -v | --version) echo "xui-node $XUI_NODE_VERSION" ;;
