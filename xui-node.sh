@@ -16,7 +16,7 @@
 set -Eeuo pipefail
 umask 022
 
-XUI_NODE_VERSION=1.4.0
+XUI_NODE_VERSION=1.4.1
 REPO=fishermanxzx/xui-node
 RAW_URL="https://raw.githubusercontent.com/${REPO}/${XUI_NODE_REF:-main}"
 
@@ -148,6 +148,8 @@ load_result() {
 apt_install() {
   local i
   export DEBIAN_FRONTEND=noninteractive
+  # 只装新包,不让 needrestart 在 apt 结束时去重启服务(它重启服务时,紧接着的 systemctl 偶尔会失败)
+  export NEEDRESTART_SUSPEND=1
   if command -v cloud-init >/dev/null; then timeout 600 cloud-init status --wait >/dev/null 2>&1 || true; fi
   for i in $(seq 1 20); do
     if "${APT[@]}" update -qq; then break; fi
@@ -156,6 +158,16 @@ apt_install() {
     sleep 15
   done
   "${APT[@]}" install -y -qq "$@" >/dev/null
+}
+
+# systemctl enable 偶尔会失败一次(刚装完软件、systemd 还在忙),重试几次;最后还不行就显示它的报错
+sd_enable() {
+  local i out
+  for i in 1 2 3 4 5; do
+    out=$(systemctl enable "$@" 2>&1) && return 0
+    sleep 2
+  done
+  die "systemctl enable $* 失败:$(printf '%s' "$out" | tail -n 3)"
 }
 
 # ---------------- 3x-ui 接口 ----------------
@@ -984,7 +996,7 @@ EOF
       fi
     } >"$NGINX_CONF"
     nginx -t -q
-    systemctl enable nginx >/dev/null 2>&1
+    sd_enable nginx
     systemctl reload nginx 2>/dev/null || systemctl restart nginx
   }
   write_nginx
@@ -1176,7 +1188,7 @@ OnUnitActiveSec=10min
 WantedBy=timers.target
 EOF
   systemctl daemon-reload
-  systemctl enable --now "$PIN_UNIT.timer" >/dev/null 2>&1
+  sd_enable --now "$PIN_UNIT.timer"
   ok "Xray $WANT,版本锁定已开(每 10 分钟检查)"
 }
 
@@ -1481,7 +1493,7 @@ fw_apply() {
   nft -c -f "$tmp" || { rm -f "$tmp"; die "规则检查没通过"; }
   # 开机自动加载(没确认被撤销时会再关掉)
   systemctl daemon-reload
-  systemctl enable "$FW_UNIT" >/dev/null 2>&1
+  sd_enable "$FW_UNIT"
   if nft list table inet "$FW_TABLE" >/dev/null 2>&1 && cmp -s "$tmp" "$FW_RULES"; then
     rm -f "$tmp"
     ok "防火墙规则没变:放行 $(fw_desc "$ports" "$udp")"
