@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# xui-node:把一台 Debian / Ubuntu VPS 装成 3x-ui 的 VLESS + Reality 节点(443「偷自己」)。
+# xui-node:把一台 Debian / Ubuntu VPS 装成 3x-ui 节点:VLESS + Reality(TCP 443「偷自己」)或 Hysteria2(UDP 443),二选一。
 # https://github.com/fishermanxzx/xui-node
 #
 # 用法(root):
@@ -16,7 +16,7 @@
 set -Eeuo pipefail
 umask 022
 
-XUI_NODE_VERSION=1.3.0
+XUI_NODE_VERSION=1.4.0
 REPO=fishermanxzx/xui-node
 RAW_URL="https://raw.githubusercontent.com/${REPO}/${XUI_NODE_REF:-main}"
 
@@ -49,6 +49,12 @@ TOKEN_NAME=xui-node
 SOCKS_REMARK=socks
 DEFAULT_PANEL_PORT=2096
 DEFAULT_REALITY_PORT=443
+# 节点协议二选一:vless = VLESS + Reality(TCP),hy2 = Hysteria2(UDP,salamander 混淆)
+DEFAULT_PROTOCOL=vless
+DEFAULT_HY2_PORT=443
+# 老版本的结果文件里没有这两项:按 VLESS 节点算
+PROTOCOL=$DEFAULT_PROTOCOL
+HY2_PORT=$DEFAULT_HY2_PORT
 DEFAULT_SOCKS_PORT=10001
 # keep = 用 3x-ui 自带的 Xray,不锁定
 DEFAULT_XRAY=keep
@@ -213,14 +219,17 @@ usage_install() {
 
   --domain FQDN            本机域名(要先解析到本机 IP;Cloudflare 用灰云)
   --panel-port N           面板端口(默认 ${DEFAULT_PANEL_PORT})
-  --reality-port N         Reality 入站端口(默认 ${DEFAULT_REALITY_PORT})
+  --protocol vless|hy2     节点协议,二选一:vless = VLESS + Reality(TCP),hy2 = Hysteria2(UDP,salamander 混淆)
+                           (默认 ${DEFAULT_PROTOCOL};装好后不能直接换,要先在面板里删掉原来的入站)
+  --reality-port N         Reality 入站端口,TCP(默认 ${DEFAULT_REALITY_PORT})
+  --hy2-port N             Hysteria2 入站端口,UDP(默认 ${DEFAULT_HY2_PORT})
   --socks-port N           SOCKS5 端口,防火墙放行;0 = 不预留(默认 ${DEFAULT_SOCKS_PORT})
   --socks-inbound          在 SOCKS5 端口建好入站(账号密码认证,支持 UDP);不加就只预留端口,以后可以执行 xui-node socks
   --xray-version vX.Y.Z    锁定 Xray 内核版本(通过 3x-ui 接口切换,每 10 分钟检查);默认 keep = 用 3x-ui 自带的、不锁定
   --xui-version vX.Y.Z     3x-ui 版本(默认最新 release)
   --no-firewall            不启用本脚本的防火墙
   --ssh-port N[,N]         防火墙放行的 SSH 端口(默认自动识别:sshd 配置、实际监听、ssh.socket、当前连接,再加上次的)
-  --remark NAME            Reality 入站备注(默认域名第一段;只在新建入站时用)
+  --remark NAME            节点入站备注(默认域名第一段;只在新建入站时用)
   --ip IP                  本机公网 IPv4(默认自动探测)
   --acme-email EMAIL       Let's Encrypt 账号邮箱(可不填;只在第一次签证书时用)
   --skip-dns-check         不检查域名是否已解析到本机
@@ -284,7 +293,11 @@ dns_points_here() {
   [[ " $RESOLVED " == *" $PUBLIC_IP "* ]]
 }
 
-declare -A PORT_LABEL=([PANEL_PORT]="面板端口" [REALITY_PORT]="Reality 端口" [SOCKS_PORT]="SOCKS 端口")
+declare -A PORT_LABEL=([PANEL_PORT]="面板端口" [REALITY_PORT]="Reality 端口" [SOCKS_PORT]="SOCKS 端口" [HY2_PORT]="Hysteria2 端口")
+# 本脚本占用的 TCP 端口(Hysteria2 走 UDP,不和它们冲突)
+tcp_port_names() {
+  if [[ ${PROTOCOL:-vless} == hy2 ]]; then echo "PANEL_PORT SOCKS_PORT"; else echo "PANEL_PORT REALITY_PORT SOCKS_PORT"; fi
+}
 # check_port 变量名 值:不合适就说明原因并返回 1
 check_port() {
   local self=$1 v=$2 p name s w o
@@ -296,7 +309,7 @@ check_port() {
   for s in $SSH_PORTS; do
     if [[ $p == "$s" ]]; then warn "和 SSH 端口重了"; return 1; fi
   done
-  for name in PANEL_PORT REALITY_PORT SOCKS_PORT; do
+  for name in $(tcp_port_names); do
     [[ $name != "$self" ]] || continue
     o=${!name:-}
     is_port "$o" || continue
@@ -316,6 +329,20 @@ check_port() {
 v_domain() { is_domain "$1" || { warn "不是有效的域名,例如 us1.example.com"; return 1; }; }
 v_panel_port() { check_port PANEL_PORT "$1"; }
 v_reality_port() { check_port REALITY_PORT "$1"; }
+port_owner_udp() { ss -Hlunp "sport = :$1" 2>/dev/null || true; }
+# Hysteria2 的 UDP 端口:只看 UDP 上有没有别的程序
+v_hy2_port() {
+  local p w
+  is_port "$1" || { warn "端口要是 1-65535 的数字"; return 1; }
+  p=$((10#$1))
+  w=$(port_owner_udp "$p")
+  if [[ -n $w && ! $w =~ \"(xray-linux[^\"]*|x-ui)\" ]]; then warn "UDP 端口 $p 被别的程序占用:${w%%$'\n'*}"; return 1; fi
+  if [[ ${EXISTING_XUI:-} == keep && $w =~ \"xray ]]; then
+    warn "UDP 端口 $p 上已经有旧入站在用(沿用旧 3x-ui 时脚本不改已有入站):换个端口,或者先在面板里删掉 / 挪开它"
+    return 1
+  fi
+}
+v_protocol() { [[ $1 == vless || $1 == hy2 ]] || { warn "协议只能是 vless 或 hy2"; return 1; }; }
 v_socks_port() { check_port SOCKS_PORT "$1"; }
 v_xray() { [[ $1 == keep || $1 =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]] || { warn "写成 v26.11.9 这样,或者 keep"; return 1; }; }
 v_email() { [[ $1 =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]] || { warn "邮箱格式不对"; return 1; }; }
@@ -324,7 +351,7 @@ v_ssh_ports() {
   [[ -n $(words "$1") ]] || { warn "至少要有一个 SSH 端口"; return 1; }
   for p in $(words "$1"); do
     is_port "$p" || { warn "不是端口: $p"; return 1; }
-    for name in PANEL_PORT REALITY_PORT SOCKS_PORT; do
+    for name in $(tcp_port_names); do
       o=${!name:-}
       is_port "$o" || continue
       if [[ $((10#$o)) == "$((10#$p))" ]]; then warn "SSH 端口 $p 和「${PORT_LABEL[$name]}」重了"; return 1; fi
@@ -344,8 +371,13 @@ validate_inputs() {
     warn "当前 SSH 连接用的 $cur 端口也会放行(免得断开后连不回来)"
   fi
   v_ssh_ports "$SSH_PORTS" || die "SSH 端口不对: $SSH_PORTS"
+  v_protocol "$PROTOCOL" || die "--protocol 只能是 vless 或 hy2"
   v_panel_port "$PANEL_PORT" || die "面板端口 $PANEL_PORT 不能用"
-  v_reality_port "$REALITY_PORT" || die "Reality 端口 $REALITY_PORT 不能用"
+  if [[ $PROTOCOL == hy2 ]]; then
+    v_hy2_port "$HY2_PORT" || die "Hysteria2 端口 $HY2_PORT 不能用"
+  else
+    v_reality_port "$REALITY_PORT" || die "Reality 端口 $REALITY_PORT 不能用"
+  fi
   v_socks_port "$SOCKS_PORT" || die "SOCKS 端口 $SOCKS_PORT 不能用"
   [[ $SOCKS_INBOUND == 0 || $((10#$SOCKS_PORT)) != 0 ]] || die "要建 SOCKS5 入站(--socks-inbound),SOCKS 端口就不能是 0"
   v_xray "$XRAY_VERSION" || die "Xray 版本 $XRAY_VERSION 不对"
@@ -354,6 +386,7 @@ validate_inputs() {
   [[ -z $ACME_EMAIL ]] || v_email "$ACME_EMAIL" || die "邮箱不对: $ACME_EMAIL"
   PANEL_PORT=$((10#$PANEL_PORT))
   REALITY_PORT=$((10#$REALITY_PORT))
+  HY2_PORT=$((10#$HY2_PORT))
   SOCKS_PORT=$((10#$SOCKS_PORT))
   SSH_PORTS=$(words "$SSH_PORTS")
   if [[ $SKIP_DNS_CHECK -eq 0 && $DNS_OK -eq 0 ]]; then
@@ -368,23 +401,72 @@ recheck_ports() {
   w=$(port_owner 80)
   [[ -z $w || $w =~ \"nginx\" ]] || die "80 端口被别的程序占用(签证书要用):${w%%$'\n'*}"
   v_panel_port "$PANEL_PORT" || die "面板端口 $PANEL_PORT 不能用"
-  v_reality_port "$REALITY_PORT" || die "Reality 端口 $REALITY_PORT 不能用"
+  if [[ $PROTOCOL == hy2 ]]; then
+    v_hy2_port "$HY2_PORT" || die "Hysteria2 端口 $HY2_PORT 不能用"
+  else
+    v_reality_port "$REALITY_PORT" || die "Reality 端口 $REALITY_PORT 不能用"
+  fi
   if [[ $SOCKS_INBOUND == 1 ]]; then v_socks_port "$SOCKS_PORT" || die "SOCKS 端口 $SOCKS_PORT 不能用"; fi
 }
 
 # 本机上本脚本建的 Reality 入站(target 指向本机站点的 vless)要和这次的端口、域名对得上;对不上就停下,什么都不改。
 # 对得上 REALITY_EXISTS=1;还没有 REALITY_EXISTS=0
 REALITY_EXISTS=0
+# 本脚本建的入站:Reality 的伪装目标是本机站点;Hysteria2 用的是 Let's Encrypt 的域名证书
+JQ_STREAM='(.streamSettings | if type == "string" then (fromjson? // {}) else . end)'
+managed_reality() {
+  jq -c --arg t "127.0.0.1:$SITE_PORT" "[.[]? | select(.protocol == \"vless\") | select(($JQ_STREAM.realitySettings.target // \"\") == \$t)]" <<<"$1"
+}
+managed_hy2() {
+  jq -c "[.[]? | select(.protocol == \"hysteria\")
+    | select(any($JQ_STREAM.tlsSettings.certificates[]?; (.certificateFile // \"\") | startswith(\"/etc/letsencrypt/live/\")))]" <<<"$1"
+}
+# 核对面板上已有的入站:一台只能是 VLESS + Reality 或 Hysteria2 其中一种
+check_main_inbound() {
+  local inbounds=$1 other
+  if [[ $PROTOCOL == hy2 ]]; then
+    other=$(managed_reality "$inbounds" | jq -r '[.[] | .port | tostring] | join("、")')
+    [[ -z $other ]] ||
+      die "这台已经是 VLESS + Reality 节点(TCP $other 端口)。一台只能二选一:要换成 Hysteria2,先在面板里删掉 Reality 入站再执行;不换就重新执行时选 VLESS + Reality"
+    check_hy2 "$inbounds"
+  else
+    other=$(managed_hy2 "$inbounds" | jq -r '[.[] | .port | tostring] | join("、")')
+    [[ -z $other ]] ||
+      die "这台已经是 Hysteria2 节点(UDP $other 端口)。一台只能二选一:要换成 VLESS + Reality,先在面板里删掉 Hysteria2 入站再执行;不换就重新执行时选 Hysteria2"
+    check_reality "$inbounds"
+  fi
+}
+check_hy2() {
+  local inbounds=$1 managed ib other names
+  managed=$(managed_hy2 "$inbounds")
+  ib=$(jq -c --argjson p "$HY2_PORT" '[.[] | select(.port == $p)][0] // empty' <<<"$managed")
+  if [[ -z $ib ]]; then
+    other=$(jq -r '[.[] | .port | tostring] | join("、")' <<<"$managed")
+    [[ -z $other ]] ||
+      die "本机的 Hysteria2 入站在 UDP $other 端口,这次填的是 $HY2_PORT。脚本不改已有入站的端口(用户的链接都要跟着变):要换就先在面板里改好再重跑,不换就重跑时填 $other"
+    # 同一个端口上已经有走 UDP 的入站(TCP 的不冲突)
+    other=$(jq -r --argjson p "$HY2_PORT" '[.[]? | select(.port == $p) | select(.protocol == "hysteria" or .protocol == "wireguard" or .protocol == "amneziawg" or .protocol == "tuic")][0]
+      | if . == null then "" else (.remark // "") + "(" + (.protocol // "") + ")" end' <<<"$inbounds")
+    [[ -z $other ]] || die "面板上 UDP $HY2_PORT 端口已经有入站 $other,换个 Hysteria2 端口,或者先在面板里删掉它"
+    HY2_EXISTS=0
+    return 0
+  fi
+  names=$(jq -r "$JQ_STREAM.tlsSettings.serverName // \"\"" <<<"$ib")
+  [[ $names == "$DOMAIN" ]] ||
+    die "本机 UDP $HY2_PORT 端口 Hysteria2 入站的 SNI 是「${names:-空}」,不是 $DOMAIN。脚本不改已有入站:要换域名就先在面板里把 SNI 和证书改好再重跑,不换就重跑时填原来的域名"
+  HY2_EXISTS=1
+}
 check_reality() {
   local inbounds=$1 managed ib other names
-  managed=$(jq -c --arg t "127.0.0.1:$SITE_PORT" '[.[]? | select(.protocol == "vless")
-    | select(((.streamSettings | if type == "string" then (fromjson? // {}) else . end).realitySettings.target // "") == $t)]' <<<"$inbounds")
+  managed=$(managed_reality "$inbounds")
   ib=$(jq -c --argjson p "$REALITY_PORT" '[.[] | select(.port == $p)][0] // empty' <<<"$managed")
   if [[ -z $ib ]]; then
     other=$(jq -r '[.[] | .port | tostring] | join("、")' <<<"$managed")
     [[ -z $other ]] ||
       die "本机的 Reality 入站在 $other 端口,这次填的是 $REALITY_PORT。脚本不改已有入站的端口(用户的链接都要跟着变):要换就先在面板里改好入站端口再重跑,不换就重跑时填 $other"
-    other=$(jq -r --argjson p "$REALITY_PORT" '[.[]? | select(.port == $p)][0] | if . == null then "" else (.remark // "") + "(" + (.protocol // "") + ")" end' <<<"$inbounds")
+    # 走 UDP 的入站(Hysteria2 等)和 TCP 端口不冲突
+    other=$(jq -r --argjson p "$REALITY_PORT" '[.[]? | select(.port == $p) | select(.protocol | IN("hysteria", "wireguard", "amneziawg", "tuic") | not)][0]
+      | if . == null then "" else (.remark // "") + "(" + (.protocol // "") + ")" end' <<<"$inbounds")
     [[ -z $other ]] || die "面板上 $REALITY_PORT 端口已经有入站 $other,换个 Reality 端口,或者先在面板里删掉它"
     REALITY_EXISTS=0
     return 0
@@ -422,7 +504,7 @@ precheck_existing() {
     warn "用上次的信息连不上面板,先不核对已有入站"
     return 0
   fi
-  check_reality "$inbounds"
+  check_main_inbound "$inbounds"
   if [[ $SOCKS_INBOUND == 1 ]]; then socks_check_conflict "$inbounds"; fi
 }
 
@@ -485,8 +567,8 @@ choose_existing_xui() {
     info "这台机器上已经装了 3x-ui($OLD_XUI_DESC),不是 xui-node 装的。"
     [[ -z $OLD_XRAY_PORTS ]] || info "旧入站在用的端口:$OLD_XRAY_PORTS"
     info "1) 重装:旧数据(入站、用户、面板账号)先备份到 $BACKUP_DIR/,再卸载旧 3x-ui、全新安装。旧入站上的用户会断开。"
-    info "2) 保留:沿用旧 3x-ui 继续装,入站和用户不动;面板换到新端口、关掉自带的订阅服务、新建 Reality 入站。"
-    hint "   保留时:Reality 端口和面板端口上不能已经有旧入站;开了防火墙的话,其它端口上的旧入站会被挡住。"
+    info "2) 保留:沿用旧 3x-ui 继续装,入站和用户不动;面板换到新端口、关掉自带的订阅服务、新建节点入站。"
+    hint "   保留时:节点端口和面板端口上不能已经有旧入站;开了防火墙的话,其它端口上的旧入站会被挡住。"
     while :; do
       read -rp "    选 1 或 2: " a || die "输入中断"
       case "$(trim "$a")" in
@@ -569,13 +651,13 @@ ask_yn() {
 ask_title() { printf '\n%s[%s/6] %s%s\n' "$C_B" "$1" "$2" "$C_0"; }
 
 wizard() {
-  local a
+  local a b
   printf '\n%sxui-node %s 安装向导%s\n' "$C_B" "$XUI_NODE_VERSION" "$C_0"
   info "系统 $OS_NAME,公网 IP $PUBLIC_IP"
   hint "每一步直接回车就用方括号里的默认值。"
 
   ask_title 1 "域名"
-  hint "要一个已经解析到本机 $PUBLIC_IP 的域名:签真证书,也给 Reality 当伪装站点。"
+  hint "要一个已经解析到本机 $PUBLIC_IP 的域名:签真证书(Reality 的伪装站点、Hysteria2 的 TLS 都用它)。"
   hint "用 Cloudflare 的话要灰云(仅 DNS),不能开代理(小黄云)。"
   ask DOMAIN "域名" "$DOMAIN" v_domain
   DOMAIN=${DOMAIN,,}
@@ -607,9 +689,26 @@ wizard() {
   hint "3x-ui 面板走 HTTPS,用同一张证书。3x-ui 自带的订阅服务会关掉(它默认也占 2096)。"
   ask PANEL_PORT "面板端口" "$PANEL_PORT" v_panel_port
 
-  ask_title 3 "Reality 端口"
-  hint "VLESS + Reality 入站,所有用户共用这一个端口。没通过 Reality 认证的访问看到的是本机的真站点。"
-  ask REALITY_PORT "Reality 端口" "$REALITY_PORT" v_reality_port
+  ask_title 3 "协议"
+  hint "一台节点只用一种协议,所有用户共用一个入站:"
+  hint "  1 = VLESS + Reality(TCP):没通过 Reality 认证的访问看到的是本机的真站点和真证书。"
+  hint "  2 = Hysteria2(UDP):TLS 用本机域名的证书,开 salamander 混淆(客户端要填混淆密码,分享链接里自带)。"
+  a=1
+  [[ $PROTOCOL != hy2 ]] || a=2
+  while :; do
+    read -rp "    协议(1 / 2) [$a]: " b || die "输入中断"
+    b=$(trim "${b:-$a}")
+    case "${b,,}" in
+      1 | vless) PROTOCOL=vless; break ;;
+      2 | hy2 | hysteria2) PROTOCOL=hy2; break ;;
+      *) warn "请输入 1 或 2" ;;
+    esac
+  done
+  if [[ $PROTOCOL == hy2 ]]; then
+    ask HY2_PORT "Hysteria2 端口(UDP)" "$HY2_PORT" v_hy2_port
+  else
+    ask REALITY_PORT "Reality 端口(TCP)" "$REALITY_PORT" v_reality_port
+  fi
 
   ask_title 4 "SOCKS5"
   hint "给 SOCKS5 预留一个端口(防火墙放行)。可以现在就在这个端口建好 SOCKS5 入站(账号密码认证,支持 UDP),"
@@ -642,7 +741,8 @@ wizard() {
 }
 
 fw_open_ports() {
-  local p="80 $REALITY_PORT $PANEL_PORT"
+  local p="80 $PANEL_PORT"
+  [[ ${PROTOCOL:-vless} == hy2 ]] || p="$p $REALITY_PORT"
   [[ $SOCKS_PORT == 0 ]] || p="$p $SOCKS_PORT"
   words "$p"
 }
@@ -653,25 +753,30 @@ ephemeral_range() {
   if [[ -r /proc/sys/net/ipv4/ip_local_port_range ]]; then read -r lo hi </proc/sys/net/ipv4/ip_local_port_range || true; fi
   if is_port "$lo" && is_port "$hi" && ((lo <= hi)); then echo "$lo-$hi"; else echo "32768-60999"; fi
 }
-# 建了 SOCKS5 入站时要放行的 UDP:新版 Xray 每次 UDP ASSOCIATE 都另开一个系统临时端口收发 UDP,
-# 不走 SOCKS 端口本身(老版本走),所以两样都放行。Xray 只收发起认证的那个 IP 发来的包。
+# 要放行的 UDP:
+# - Hysteria2 节点:它的 UDP 端口
+# - 建了 SOCKS5 入站:新版 Xray 每次 UDP ASSOCIATE 都另开一个系统临时端口收发 UDP,
+#   不走 SOCKS 端口本身(老版本走),所以两样都放行。Xray 只收发起认证的那个 IP 发来的包。
+# 按起点排序输出,落在端口段里的单个端口不再单列
 fw_open_udp() {
-  local r lo hi p=$((10#${SOCKS_PORT:-0}))
-  [[ $p != 0 && ${SOCKS_INBOUND:-0} == 1 ]] || return 0
-  r=$(ephemeral_range)
-  lo=${r%-*} hi=${r#*-}
-  if ((p >= lo && p <= hi)); then
-    echo "$r"
-  elif ((p < lo)); then
-    echo "$p $r"
-  else
-    echo "$r $p"
+  local items=() r="" x p
+  [[ ${PROTOCOL:-vless} != hy2 ]] || items+=("$((10#${HY2_PORT:-0}))")
+  p=$((10#${SOCKS_PORT:-0}))
+  if [[ $p != 0 && ${SOCKS_INBOUND:-0} == 1 ]]; then
+    r=$(ephemeral_range)
+    items+=("$p" "$r")
   fi
+  for x in "${items[@]}"; do
+    [[ $x != 0 ]] || continue
+    if [[ $x != *-* && -n $r ]] && ((x >= 10#${r%-*} && x <= 10#${r#*-})); then continue; fi
+    echo "$x"
+  done | sort -t- -k1,1n -u | xargs
 }
 # 防火墙放行端口的说明:fw_desc TCP端口 [UDP端口]
 fw_desc() {
   printf 'TCP %s' "$(sed 's/ /, /g' <<<"$1")"
-  [[ -z ${2:-} ]] || printf ';UDP %s(SOCKS5 的 UDP)' "$(sed 's/ /, /g' <<<"$2")"
+  [[ -z ${2:-} ]] || printf ';UDP %s' "$(sed 's/ /, /g' <<<"$2")"
+  [[ ${2:-} != *-* ]] || printf '(端口段是 SOCKS5 的 UDP 用的系统临时端口)'
 }
 
 show_plan() {
@@ -684,7 +789,11 @@ show_plan() {
     keep) info "3x-ui         已有($OLD_XUI_DESC,不是 xui-node 装的):沿用,入站和用户不动,自带订阅服务关掉" ;;
   esac
   info "面板端口      $PANEL_PORT(HTTPS)"
-  info "Reality 端口  $REALITY_PORT(伪装目标 127.0.0.1:$SITE_PORT 上的本机站点,SNI $DOMAIN)"
+  if [[ $PROTOCOL == hy2 ]]; then
+    info "Hysteria2     UDP $HY2_PORT(TLS 用 $DOMAIN 的证书,salamander 混淆)"
+  else
+    info "Reality 端口  $REALITY_PORT(伪装目标 127.0.0.1:$SITE_PORT 上的本机站点,SNI $DOMAIN)"
+  fi
   if [[ $SOCKS_PORT == 0 ]]; then
     info "SOCKS5        不预留端口"
   elif [[ $SOCKS_INBOUND == 1 ]]; then
@@ -723,7 +832,7 @@ setup_deps() {
       ufw --force disable >/dev/null
       warn "ufw 开着,会和本脚本的规则叠加,已关闭 ufw"
     else
-      warn "ufw 开着:要在 ufw 里放行 80、$REALITY_PORT、$PANEL_PORT,否则签证书和连接会失败"
+      warn "ufw 开着:要在 ufw 里放行 $(fw_desc "$(fw_open_ports)" "$(fw_open_udp)"),否则签证书和连接会失败"
     fi
   fi
 }
@@ -781,7 +890,7 @@ acme_selfcheck() {
 }
 
 setup_site() {
-  local title nginx_ver listen_tls listen_v6 acct site_url
+  local title nginx_ver listen_tls listen_v6 acct site_url site_80
   step "Nginx 站点 + Let's Encrypt 证书"
   install -d -m 755 "$SITE_ROOT" "$ACME_ROOT"
   if [[ ! -f $SITE_ROOT/index.html ]]; then
@@ -835,9 +944,14 @@ EOF
   # 内核关了 IPv6 时 Nginx 听 [::]:80 会起不来(procfs 的文件大小总是 0,要看内容)
   listen_v6=""
   [[ -z $(cat /proc/net/if_inet6 2>/dev/null || true) ]] || listen_v6="listen [::]:80 default_server;"
-  # 80 端口跳到真站点:对外只有 Reality 端口能看到它
+  # 80 端口:VLESS 节点跳到真站点(对外只有 Reality 端口能看到它);Hysteria2 节点没有 TCP 的 HTTPS,80 直接给站点
   site_url="https://${DOMAIN}"
   [[ $REALITY_PORT == 443 ]] || site_url+=":${REALITY_PORT}"
+  if [[ $PROTOCOL == hy2 ]]; then
+    site_80="location / { root ${SITE_ROOT}; index index.html; try_files \$uri \$uri/ =404; }"
+  else
+    site_80="location / { return 301 ${site_url}\$request_uri; }"
+  fi
   write_nginx() {
     {
       cat <<EOF
@@ -847,7 +961,7 @@ server {
     ${listen_v6}
     server_name _;
     location ^~ /.well-known/acme-challenge/ { root ${ACME_ROOT}; default_type text/plain; }
-    location / { return 301 ${site_url}\$request_uri; }
+    ${site_80}
 }
 EOF
       if [[ -f $CERT_DIR/fullchain.pem ]]; then
@@ -1067,9 +1181,47 @@ EOF
 }
 
 setup_inbound() {
+  if [[ $PROTOCOL == hy2 ]]; then setup_hy2; else setup_reality; fi
+}
+# Hysteria2:TLS 用本机域名的证书(和 Nginx、面板同一张;不是一次性加载时 Xray 每小时重新读一次证书文件,
+# 续期后不用重启。ocspStapling 留 0:Let's Encrypt 已经不提供 OCSP,填了只会每小时报一次警告),
+# salamander 混淆密码随机生成。入站里先不放用户
+setup_hy2() {
+  local inbounds stream body
+  step "Hysteria2 入站(UDP $HY2_PORT,SNI $DOMAIN,salamander 混淆)"
+  inbounds=$(api GET /inbounds/list) || die "读不到面板上的入站"
+  check_main_inbound "$inbounds"
+  if [[ $HY2_EXISTS == 1 ]]; then
+    info "已有,跳过"
+    return 0
+  fi
+  # 混淆密码只经过标准输入,不出现在命令行里
+  stream=$(rand_hex 16 | jq -Rc --arg d "$DOMAIN" --arg c "$CERT_DIR/fullchain.pem" --arg k "$CERT_DIR/privkey.pem" '{
+    network: "hysteria", security: "tls", externalProxy: [],
+    tlsSettings: {
+      serverName: $d, minVersion: "1.2", maxVersion: "1.3", cipherSuites: "", rejectUnknownSni: false,
+      disableSystemRoot: false, enableSessionResumption: false,
+      certificates: [{ certificateFile: $c, keyFile: $k, ocspStapling: 0, oneTimeLoading: false, usage: "encipherment", buildChain: false }],
+      alpn: ["h3"], echServerKeys: "",
+      settings: { fingerprint: "", echConfigList: "", pinnedPeerCertSha256: [], verifyPeerCertByName: "" }
+    },
+    hysteriaSettings: { version: 2, auth: "", udpIdleTimeout: 60 },
+    finalmask: { udp: [{ type: "salamander", settings: { password: . } }] }
+  }')
+  body=$(jq -c --arg remark "$REMARK" --argjson port "$HY2_PORT" '{
+    up: 0, down: 0, total: 0, remark: $remark, enable: true, expiryTime: 0, listen: "", port: $port, protocol: "hysteria",
+    settings: ({ version: 2, clients: [] } | tojson),
+    streamSettings: tojson,
+    sniffing: ({ enabled: false, destOverride: ["http", "tls", "quic", "fakedns"], metadataOnly: false, routeOnly: false } | tojson)
+  }' <<<"$stream")
+  api POST /inbounds/add "$body" >/dev/null || die "新建入站失败"
+  unset stream body
+  ok "已新建(备注 $REMARK,还没有用户)"
+}
+setup_reality() {
   local keys stream body
   step "VLESS + Reality 入站(端口 $REALITY_PORT,伪装目标 127.0.0.1:$SITE_PORT,SNI $DOMAIN)"
-  check_reality "$(api GET /inbounds/list)"
+  check_main_inbound "$(api GET /inbounds/list)"
   if [[ $REALITY_EXISTS == 1 ]]; then
     info "已有,跳过"
     return 0
@@ -1250,6 +1402,16 @@ final_check() {
   done
   [[ $st == *"|running" ]] || die "Xray 没在运行(${st:-读不到状态}),看面板日志"
   [[ -z $WANT || $st == "$WANT|running" ]] || die "Xray 版本不对(${st%%|*})"
+  if [[ $PROTOCOL == hy2 ]]; then
+    for _ in $(seq 1 10); do
+      [[ ! $(port_owner_udp "$HY2_PORT") =~ \"xray ]] || break
+      sleep 1
+    done
+    [[ $(port_owner_udp "$HY2_PORT") =~ \"xray ]] || die "Xray 没在 UDP $HY2_PORT 端口监听(Hysteria2 入站没起来?看面板日志)"
+    ok "Xray ${st%%|*} 在运行;Hysteria2 在 UDP $HY2_PORT 端口监听"
+    if [[ $SOCKS_INBOUND == 1 ]]; then socks_verify || true; fi
+    return 0
+  fi
   for _ in $(seq 1 10); do
     [[ -z $(port_owner "$REALITY_PORT") ]] || break
     sleep 1
@@ -1396,12 +1558,15 @@ INTERACTIVE=0
 cmd_install() {
   local yes=0 prev_ssh
   DOMAIN="" PANEL_PORT="" REALITY_PORT="" SOCKS_PORT="" SOCKS_INBOUND="" XRAY_VERSION="" XUI_VERSION=latest
+  PROTOCOL="" HY2_PORT=""
   SSH_PORTS="" FIREWALL="" REMARK="" PUBLIC_IP="" ACME_EMAIL="" SKIP_DNS_CHECK=0 CERT_DIR="" EXISTING_XUI=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --domain) need_arg "$@"; DOMAIN=$2; shift 2 ;;
       --panel-port) need_arg "$@"; PANEL_PORT=$2; shift 2 ;;
       --reality-port) need_arg "$@"; REALITY_PORT=$2; shift 2 ;;
+      --protocol) need_arg "$@"; PROTOCOL=${2,,}; shift 2 ;;
+      --hy2-port) need_arg "$@"; HY2_PORT=$2; shift 2 ;;
       --socks-port) need_arg "$@"; SOCKS_PORT=$2; shift 2 ;;
       --socks-inbound) SOCKS_INBOUND=1; shift ;;
       --xray-version) need_arg "$@"; XRAY_VERSION=$2; shift 2 ;;
@@ -1430,11 +1595,16 @@ cmd_install() {
   [[ -n $DOMAIN ]] || DOMAIN=$(result_get DOMAIN)
   [[ -n $PANEL_PORT ]] || PANEL_PORT=$(result_get PANEL_PORT)
   [[ -n $REALITY_PORT ]] || REALITY_PORT=$(result_get REALITY_PORT)
+  [[ -n $PROTOCOL ]] || PROTOCOL=$(result_get PROTOCOL)
+  [[ -n $HY2_PORT ]] || HY2_PORT=$(result_get HY2_PORT)
   [[ -n $SOCKS_PORT ]] || SOCKS_PORT=$(result_get SOCKS_PORT)
   [[ -n $XRAY_VERSION ]] || XRAY_VERSION=$(result_get XRAY_VERSION)
   [[ -n $FIREWALL ]] || FIREWALL=$(result_get FIREWALL)
   PANEL_PORT=${PANEL_PORT:-$DEFAULT_PANEL_PORT}
   REALITY_PORT=${REALITY_PORT:-$DEFAULT_REALITY_PORT}
+  PROTOCOL=${PROTOCOL:-$DEFAULT_PROTOCOL}
+  [[ $PROTOCOL != hysteria2 ]] || PROTOCOL=hy2
+  HY2_PORT=${HY2_PORT:-$DEFAULT_HY2_PORT}
   SOCKS_PORT=${SOCKS_PORT:-$DEFAULT_SOCKS_PORT}
   # 上次建过 SOCKS5 入站,这次默认也要
   if [[ -z $SOCKS_INBOUND ]]; then
@@ -1470,7 +1640,9 @@ cmd_install() {
   result_set DOMAIN "$DOMAIN"
   result_set PUBLIC_IP "$PUBLIC_IP"
   result_set PANEL_PORT "$PANEL_PORT"
+  result_set PROTOCOL "$PROTOCOL"
   result_set REALITY_PORT "$REALITY_PORT"
+  result_set HY2_PORT "$HY2_PORT"
   result_set SOCKS_PORT "$SOCKS_PORT"
   result_set XRAY_VERSION "$XRAY_VERSION"
   result_set FIREWALL "$FIREWALL"
@@ -1501,7 +1673,12 @@ cmd_install() {
     info "旧 3x-ui 的数据和配置备份在 $(result_get XUI_BACKUP)(只有 root 可读),旧用户可以照着里面的 email / UUID 加回来。"
   fi
   info "查看:xui-node info        管理菜单:xui-node"
-  info "下一步:登录面板,在 $REALITY_PORT 端口的入站里添加用户;或者把面板地址和 token 交给管理程序。"
+  if [[ $PROTOCOL == hy2 ]]; then
+    info "下一步:登录面板,在 Hysteria2 入站(UDP $HY2_PORT)里添加用户;或者把面板地址和 token 交给管理程序。"
+    hint "服务商如果有安全组 / 云防火墙,要放行 UDP $HY2_PORT。"
+  else
+    info "下一步:登录面板,在 $REALITY_PORT 端口的入站里添加用户;或者把面板地址和 token 交给管理程序。"
+  fi
   if [[ $SOCKS_INBOUND != 1 && $SOCKS_PORT != 0 ]]; then
     hint "要在 $SOCKS_PORT 端口建 SOCKS5 入站(账号密码认证,支持 UDP):xui-node socks"
   fi
@@ -1554,7 +1731,11 @@ cmd_status() {
     api_from_result
     st=$(api GET /server/status 2>/dev/null | jq -r '"\(.xray.version // "?"),\(.xray.state // "?")"' || true)
   fi
-  info "Xray:${st:-读不到}(Reality 端口 $REALITY_PORT$([[ -n $(port_owner "$REALITY_PORT") ]] || echo ',没在监听'))"
+  if [[ ${PROTOCOL:-vless} == hy2 ]]; then
+    info "Xray:${st:-读不到}(Hysteria2 UDP 端口 $HY2_PORT$([[ $(port_owner_udp "$HY2_PORT") =~ \"xray ]] || echo ',没在监听'))"
+  else
+    info "Xray:${st:-读不到}(Reality 端口 $REALITY_PORT$([[ -n $(port_owner "$REALITY_PORT") ]] || echo ',没在监听'))"
+  fi
   if [[ ${XRAY_VERSION:-keep} == keep ]]; then pin="不锁定"; else pin="$XRAY_VERSION,定时检查$(unit_state "$PIN_UNIT.timer")"; fi
   info "版本锁定:$pin"
   info "Nginx 站点:$(unit_state nginx)"
@@ -1683,9 +1864,13 @@ cmd_menu() {
   # 每一项都在单独的进程里跑:出错照常停下(在 || / if 里调函数,bash 会忽略 set -e)
   self=$(self_path)
   while :; do
-    printf '\n%sxui-node %s%s  3x-ui Reality 节点\n' "$C_B" "$XUI_NODE_VERSION" "$C_0"
+    printf '\n%sxui-node %s%s  3x-ui 节点(VLESS + Reality / Hysteria2)\n' "$C_B" "$XUI_NODE_VERSION" "$C_0"
     if [[ -f $RESULT ]]; then
-      hint "$(result_get DOMAIN) · Reality $(result_get REALITY_PORT) · 面板 $(result_get PANEL_PORT)"
+      if [[ $(result_get PROTOCOL) == hy2 ]]; then
+        hint "$(result_get DOMAIN) · Hysteria2 UDP $(result_get HY2_PORT) · 面板 $(result_get PANEL_PORT)"
+      else
+        hint "$(result_get DOMAIN) · Reality $(result_get REALITY_PORT) · 面板 $(result_get PANEL_PORT)"
+      fi
     else
       hint "还没安装"
     fi
@@ -1721,7 +1906,7 @@ EOF
 
 usage() {
   cat <<'EOF'
-xui-node:把 Debian / Ubuntu VPS 装成 3x-ui 的 VLESS + Reality 节点
+xui-node:把 Debian / Ubuntu VPS 装成 3x-ui 节点(VLESS + Reality 或 Hysteria2,二选一)
 
   xui-node                    管理菜单
   xui-node install [选项]      安装 / 重新配置(xui-node install --help 看选项)
