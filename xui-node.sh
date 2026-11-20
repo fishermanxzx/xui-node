@@ -16,7 +16,7 @@
 set -Eeuo pipefail
 umask 022
 
-XUI_NODE_VERSION=1.2.2
+XUI_NODE_VERSION=1.3.0
 REPO=fishermanxzx/xui-node
 RAW_URL="https://raw.githubusercontent.com/${REPO}/${XUI_NODE_REF:-main}"
 
@@ -29,8 +29,14 @@ FW_TABLE=xui_node_fw
 FW_UNIT=xui-node-fw.service
 FW_REVERT=xui-node-fw-revert
 PIN_UNIT=xui-node-xray-pin
-XUI_BIN=/usr/local/x-ui/x-ui
-XUI_RESULT=/etc/x-ui/install-result.env
+XUI_DIR=/usr/local/x-ui
+XUI_BIN=$XUI_DIR/x-ui
+XUI_ETC=/etc/x-ui
+XUI_RESULT=$XUI_ETC/install-result.env
+XUI_UNIT=/etc/systemd/system/x-ui.service
+XUI_ENV=/etc/default/x-ui
+# 重装已有的 3x-ui 前,旧数据备份到这里
+BACKUP_DIR=$STATE_DIR/backup
 BBR_SYSCTL=/etc/sysctl.d/99-xui-node-bbr.conf
 BBR_MODULES=/etc/modules-load.d/xui-node-bbr.conf
 SITE_ROOT=/var/www/xui-node-site
@@ -218,6 +224,9 @@ usage_install() {
   --ip IP                  本机公网 IPv4(默认自动探测)
   --acme-email EMAIL       Let's Encrypt 账号邮箱(可不填;只在第一次签证书时用)
   --skip-dns-check         不检查域名是否已解析到本机
+  --reinstall-xui          机器上已经有 3x-ui(不是 xui-node 装的)时:旧数据备份到 ${BACKUP_DIR}/ 后卸载,全新安装
+  --keep-xui               机器上已经有 3x-ui(不是 xui-node 装的)时:沿用它继续装,入站和用户不动
+                           (这两个都不加时,在终端里会问;不在终端里就停下)
   -y, --yes                不问,直接装
 EOF
 }
@@ -297,6 +306,11 @@ check_port() {
   if [[ $self != SOCKS_PORT || ${SOCKS_INBOUND:-0} == 1 ]]; then
     w=$(port_owner "$p")
     if [[ -n $w && ! $w =~ \"(xray-linux[^\"]*|x-ui)\" ]]; then warn "端口 $p 被别的程序占用:${w%%$'\n'*}"; return 1; fi
+    # 沿用别人装的 3x-ui:Reality / 面板端口上的 Xray 是旧入站,脚本不改它
+    if [[ ${EXISTING_XUI:-} == keep && $self != SOCKS_PORT && $w =~ \"xray ]]; then
+      warn "端口 $p 上已经有旧入站在用(沿用旧 3x-ui 时脚本不改已有入站):换个端口,或者先在面板里删掉 / 挪开它"
+      return 1
+    fi
   fi
 }
 v_domain() { is_domain "$1" || { warn "不是有效的域名,例如 us1.example.com"; return 1; }; }
@@ -410,6 +424,114 @@ precheck_existing() {
   fi
   check_reality "$inbounds"
   if [[ $SOCKS_INBOUND == 1 ]]; then socks_check_conflict "$inbounds"; fi
+}
+
+# ---------------- 机器上原来就有的 3x-ui ----------------
+# EXISTING_XUI:reinstall = 旧数据备份后清空重装;keep = 沿用旧 3x-ui 继续装;空 = 不是这种情况
+EXISTING_XUI=""
+OLD_XUI_DESC=""
+OLD_XRAY_PORTS=""
+xui_present() { [[ -e $XUI_BIN || -d $XUI_ETC || -f $XUI_UNIT ]]; }
+# 不是本脚本装的:结果文件里没有 xui-node 装过 / 沿用过的记号,也没有本脚本生成的 token
+xui_foreign() { xui_present && [[ -z $(result_get XUI_BY) && -z $(result_get PANEL_TOKEN) ]]; }
+xui_desc() {
+  local v s=没在运行
+  v=$("$XUI_BIN" -v 2>/dev/null | head -1 | tr -d '[:space:]' || true)
+  ! systemctl is-active -q x-ui || s=运行中
+  printf '版本 %s,%s' "${v:-未知}" "$s"
+}
+# 旧 Xray 对外监听的端口(只听本机的不算),例如 "443/tcp 8443/udp"
+xray_public_ports() {
+  ss -Hltunp 2>/dev/null | awk '/"xray/ {
+      a = $5; p = a; sub(/.*:/, "", p); h = a; sub(/:[^:]*$/, "", h)
+      if (h ~ /^(127\.|\[::1\]|::1$|\[::ffff:127\.)/) next
+      print p "/" $1 }' | sort -t/ -k1,1n -k2,2 -u | xargs
+}
+# in_ports 端口 "列表":列表里可以有 起-止
+in_ports() {
+  local x
+  for x in $2; do
+    if [[ $x == *-* ]]; then ((10#$1 >= 10#${x%-*} && 10#$1 <= 10#${x#*-})) && return 0; else [[ $((10#$x)) == $((10#$1)) ]] && return 0; fi
+  done
+  return 1
+}
+# 沿用旧 3x-ui 时,防火墙会挡住的旧入站端口
+old_ports_blocked() {
+  local x p proto tcp udp out=""
+  [[ $FIREWALL == 1 ]] || return 0
+  tcp="$SSH_PORTS $(fw_open_ports) $(fw_conf_get EXTRA_PORTS)"
+  udp=$(fw_open_udp)
+  for x in $OLD_XRAY_PORTS; do
+    p=${x%/*} proto=${x#*/}
+    if [[ $proto == tcp ]]; then in_ports "$p" "$tcp" && continue; else in_ports "$p" "$udp" && continue; fi
+    out+=" $x"
+  done
+  echo "${out# }"
+}
+# 安装前问一次:已有的 3x-ui 是重装还是沿用。不在终端里运行时必须用参数指定
+choose_existing_xui() {
+  local a
+  if ! xui_foreign; then
+    [[ -z $EXISTING_XUI ]] || info "3x-ui 是 xui-node 装的(或以前选过沿用),--${EXISTING_XUI}-xui 不生效"
+    EXISTING_XUI=""
+    return 0
+  fi
+  OLD_XUI_DESC=$(xui_desc)
+  OLD_XRAY_PORTS=$(xray_public_ports)
+  if [[ -z $EXISTING_XUI ]]; then
+    [[ $INTERACTIVE -eq 1 ]] ||
+      die "这台机器上已经装了 3x-ui($OLD_XUI_DESC),不是 xui-node 装的。加 --reinstall-xui(旧数据备份后清空重装)或 --keep-xui(沿用旧 3x-ui 继续装)再执行"
+    printf '\n%s已有 3x-ui%s\n' "$C_B" "$C_0"
+    info "这台机器上已经装了 3x-ui($OLD_XUI_DESC),不是 xui-node 装的。"
+    [[ -z $OLD_XRAY_PORTS ]] || info "旧入站在用的端口:$OLD_XRAY_PORTS"
+    info "1) 重装:旧数据(入站、用户、面板账号)先备份到 $BACKUP_DIR/,再卸载旧 3x-ui、全新安装。旧入站上的用户会断开。"
+    info "2) 保留:沿用旧 3x-ui 继续装,入站和用户不动;面板换到新端口、关掉自带的订阅服务、新建 Reality 入站。"
+    hint "   保留时:Reality 端口和面板端口上不能已经有旧入站;开了防火墙的话,其它端口上的旧入站会被挡住。"
+    while :; do
+      read -rp "    选 1 或 2: " a || die "输入中断"
+      case "$(trim "$a")" in
+        1) EXISTING_XUI=reinstall; break ;;
+        2) EXISTING_XUI=keep; break ;;
+        *) warn "请输入 1 或 2" ;;
+      esac
+    done
+  fi
+  if [[ $EXISTING_XUI == reinstall ]]; then
+    if [[ -r $XUI_ENV ]] && grep -q '^XUI_DB_TYPE=postgres' "$XUI_ENV"; then
+      die "旧 3x-ui 用的是 PostgreSQL 数据库,脚本不会自动备份它:请先自己备份,卸载旧 3x-ui(x-ui uninstall)后再执行"
+    fi
+  else
+    [[ -x $XUI_BIN ]] || die "旧 3x-ui 不完整(没有 $XUI_BIN),沿用不了:重新执行选「重装」"
+    # 本脚本用 x-ui setting -getApiToken -tokenName -tokenScope 生成 token,v3.9.0 起才有 -tokenScope
+    a=$("$XUI_BIN" setting -h 2>&1 || true)
+    [[ $a == *-getApiToken* && $a == *-tokenScope* ]] ||
+      die "旧 3x-ui 版本太老(要 v3.9.0 以上),沿用不了:重新执行选「重装」,或者先升级 3x-ui(x-ui update)"
+  fi
+}
+# 重装:停掉旧 3x-ui,数据和配置整个备份,确认备份好了再卸载
+xui_backup_remove() {
+  local dir
+  info "先备份旧 3x-ui 的数据和配置,再卸载"
+  install -d -m 700 "$BACKUP_DIR"
+  # 每次一个新目录(mktemp 建的是 700),不会和以前的备份混在一起
+  dir=$(mktemp -d "$BACKUP_DIR/x-ui-$(date +%Y%m%d-%H%M%S)-XXXX")
+  systemctl stop x-ui 2>/dev/null || true
+  [[ ! -d $XUI_ETC ]] || cp -a "$XUI_ETC" "$dir/etc-x-ui"
+  [[ ! -f $XUI_DIR/bin/config.json ]] || cp -a "$XUI_DIR/bin/config.json" "$dir/xray-config.json"
+  [[ ! -f $XUI_ENV ]] || cp -a "$XUI_ENV" "$dir/default-x-ui"
+  [[ ! -f $XUI_UNIT ]] || cp -a "$XUI_UNIT" "$dir/x-ui.service"
+  if [[ -f $XUI_ETC/x-ui.db ]]; then
+    cmp -s "$XUI_ETC/x-ui.db" "$dir/etc-x-ui/x-ui.db" || die "备份旧数据库失败,没有卸载(旧 3x-ui 已停,systemctl start x-ui 可以恢复)"
+  fi
+  result_set XUI_BACKUP "$dir"
+  systemctl disable x-ui >/dev/null 2>&1 || true
+  rm -f "$XUI_UNIT"
+  rm -rf "${XUI_UNIT}.d"
+  systemctl daemon-reload
+  systemctl reset-failed x-ui >/dev/null 2>&1 || true
+  rm -rf "$XUI_ETC" "$XUI_DIR"
+  rm -f "$XUI_ENV" /usr/bin/x-ui
+  ok "旧 3x-ui 已卸载,数据和配置备份在 $dir(只有 root 可读)"
 }
 
 # ---------------- 安装:向导 ----------------
@@ -557,6 +679,10 @@ show_plan() {
   printf '\n'
   info "域名          $DOMAIN"
   info "公网 IP       $PUBLIC_IP"
+  case $EXISTING_XUI in
+    reinstall) info "3x-ui         已有($OLD_XUI_DESC,不是 xui-node 装的):旧数据备份到 $BACKUP_DIR/ 后卸载,全新安装" ;;
+    keep) info "3x-ui         已有($OLD_XUI_DESC,不是 xui-node 装的):沿用,入站和用户不动,自带订阅服务关掉" ;;
+  esac
   info "面板端口      $PANEL_PORT(HTTPS)"
   info "Reality 端口  $REALITY_PORT(伪装目标 127.0.0.1:$SITE_PORT 上的本机站点,SNI $DOMAIN)"
   if [[ $SOCKS_PORT == 0 ]]; then
@@ -573,6 +699,10 @@ show_plan() {
     info "防火墙        放行 $(fw_desc "$(words "$SSH_PORTS $(fw_open_ports) $extra")" "$(fw_open_udp)"),其余丢弃(SSH:$(words "$SSH_PORTS" | sed 's/ /, /g'))"
   else
     info "防火墙        不启用"
+  fi
+  if [[ $EXISTING_XUI == keep ]]; then
+    extra=$(old_ports_blocked)
+    [[ -z $extra ]] || warn "防火墙会挡住旧入站的端口 $extra,用这些端口的旧用户会连不上"
   fi
 }
 
@@ -779,7 +909,13 @@ setup_xui() {
   local tmp_port xu xp token settings sub_port who fresh=0
   step "安装 3x-ui"
   work_dir
-  if [[ -x $XUI_BIN ]] && systemctl is-active -q x-ui; then
+  # 沿用别人装的 3x-ui:没在运行就先启动,并记下来(以后重新执行不再问)
+  if [[ $EXISTING_XUI == keep ]]; then
+    systemctl is-active -q x-ui || systemctl start x-ui >/dev/null 2>&1 || true
+    systemctl is-active -q x-ui || die "旧 3x-ui 没在运行,也启动不了(看原因:systemctl status x-ui);可以重新执行选「重装」"
+    result_set XUI_BY existing
+  fi
+  if [[ $EXISTING_XUI != reinstall && -x $XUI_BIN ]] && systemctl is-active -q x-ui; then
     info "已安装,跳过($($XUI_BIN -v 2>/dev/null | head -1))"
   else
     if [[ $XUI_VERSION == latest ]]; then
@@ -787,12 +923,16 @@ setup_xui() {
       [[ $XUI_VERSION =~ ^v[0-9] ]] || die "取不到 3x-ui 最新版本号"
     fi
     info "版本 $XUI_VERSION"
-    curl -fsSL --max-time 60 "https://raw.githubusercontent.com/MHSanaei/3x-ui/${XUI_VERSION}/install.sh" -o "$WORK/install.sh"
+    curl -fsSL --max-time 60 "https://raw.githubusercontent.com/MHSanaei/3x-ui/${XUI_VERSION}/install.sh" -o "$WORK/install.sh" ||
+      die "下载 3x-ui 安装器失败(${XUI_VERSION})"
+    # 重装:安装器下载好了再卸载旧的(下载失败时旧 3x-ui 原样不动)
+    if [[ $EXISTING_XUI == reinstall ]]; then xui_backup_remove; fi
     # 先用临时端口装:3x-ui 自带的订阅服务默认占着 2096,把它挪开之后再把面板换到 $PANEL_PORT
     tmp_port=$(random_free_port) || die "挑不到空闲端口"
     # 安装器会把面板账号、密码、token 打印出来:滤掉这些行,只留进度。
     # 用管道而不是 > >(...):管道会等过滤完的输出全部打印完再往下走;安装器的退出码记在文件里
     rm -f "$WORK/xui-install.rc"
+    result_set XUI_BY xui-node
     {
       XUI_NONINTERACTIVE=1 XUI_PANEL_PORT="$tmp_port" XUI_SSL_MODE=none XUI_DB_TYPE=sqlite XUI_ENABLE_FAIL2BAN=false \
         XUI_SERVER_IP="$PUBLIC_IP" bash "$WORK/install.sh" "$XUI_VERSION" </dev/null 2>&1 ||
@@ -1256,7 +1396,7 @@ INTERACTIVE=0
 cmd_install() {
   local yes=0 prev_ssh
   DOMAIN="" PANEL_PORT="" REALITY_PORT="" SOCKS_PORT="" SOCKS_INBOUND="" XRAY_VERSION="" XUI_VERSION=latest
-  SSH_PORTS="" FIREWALL="" REMARK="" PUBLIC_IP="" ACME_EMAIL="" SKIP_DNS_CHECK=0 CERT_DIR=""
+  SSH_PORTS="" FIREWALL="" REMARK="" PUBLIC_IP="" ACME_EMAIL="" SKIP_DNS_CHECK=0 CERT_DIR="" EXISTING_XUI=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --domain) need_arg "$@"; DOMAIN=$2; shift 2 ;;
@@ -1272,6 +1412,8 @@ cmd_install() {
       --ip) need_arg "$@"; PUBLIC_IP=$2; shift 2 ;;
       --acme-email) need_arg "$@"; ACME_EMAIL=$2; shift 2 ;;
       --skip-dns-check) SKIP_DNS_CHECK=1; shift ;;
+      --reinstall-xui) EXISTING_XUI=reinstall; shift ;;
+      --keep-xui) EXISTING_XUI=keep; shift ;;
       -y | --yes) yes=1; shift ;;
       -h | --help) usage_install; return 0 ;;
       *) die "未知参数: $1(xui-node install --help 看参数)" ;;
@@ -1310,6 +1452,7 @@ cmd_install() {
     fi
   fi
 
+  choose_existing_xui
   if [[ $INTERACTIVE -eq 1 ]]; then wizard; fi
   validate_inputs
   show_plan
@@ -1353,6 +1496,9 @@ cmd_install() {
   fi
   if [[ -f $XUI_RESULT ]]; then
     info "3x-ui 安装器自己的 $XUI_RESULT 也保留了,里面的端口和地址已改成现在的。"
+  fi
+  if [[ $EXISTING_XUI == reinstall ]]; then
+    info "旧 3x-ui 的数据和配置备份在 $(result_get XUI_BACKUP)(只有 root 可读),旧用户可以照着里面的 email / UUID 加回来。"
   fi
   info "查看:xui-node info        管理菜单:xui-node"
   info "下一步:登录面板,在 $REALITY_PORT 端口的入站里添加用户;或者把面板地址和 token 交给管理程序。"
