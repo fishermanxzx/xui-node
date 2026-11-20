@@ -16,7 +16,7 @@
 set -Eeuo pipefail
 umask 022
 
-XUI_NODE_VERSION=1.2.1
+XUI_NODE_VERSION=1.2.2
 REPO=fishermanxzx/xui-node
 RAW_URL="https://raw.githubusercontent.com/${REPO}/${XUI_NODE_REF:-main}"
 
@@ -790,14 +790,17 @@ setup_xui() {
     curl -fsSL --max-time 60 "https://raw.githubusercontent.com/MHSanaei/3x-ui/${XUI_VERSION}/install.sh" -o "$WORK/install.sh"
     # 先用临时端口装:3x-ui 自带的订阅服务默认占着 2096,把它挪开之后再把面板换到 $PANEL_PORT
     tmp_port=$(random_free_port) || die "挑不到空闲端口"
-    # 安装器会把面板账号、密码、token 打印出来:滤掉这些行,只留进度
-    if ! XUI_NONINTERACTIVE=1 XUI_PANEL_PORT="$tmp_port" XUI_SSL_MODE=none XUI_DB_TYPE=sqlite XUI_ENABLE_FAIL2BAN=false \
-      XUI_SERVER_IP="$PUBLIC_IP" bash "$WORK/install.sh" "$XUI_VERSION" </dev/null \
-      > >(grep --line-buffered -Eiv 'password|username|token|webbasepath|access url|dsn|credential|secret' | sed -u 's/^/    | /') 2>&1; then
-      wait $! 2>/dev/null || true
-      die "3x-ui 安装器失败(上面是它的输出,账号密码那几行已滤掉)"
-    fi
-    wait $! 2>/dev/null || true
+    # 安装器会把面板账号、密码、token 打印出来:滤掉这些行,只留进度。
+    # 用管道而不是 > >(...):管道会等过滤完的输出全部打印完再往下走;安装器的退出码记在文件里
+    rm -f "$WORK/xui-install.rc"
+    {
+      XUI_NONINTERACTIVE=1 XUI_PANEL_PORT="$tmp_port" XUI_SSL_MODE=none XUI_DB_TYPE=sqlite XUI_ENABLE_FAIL2BAN=false \
+        XUI_SERVER_IP="$PUBLIC_IP" bash "$WORK/install.sh" "$XUI_VERSION" </dev/null 2>&1 ||
+        echo "$?" >"$WORK/xui-install.rc"
+    } | grep --line-buffered -Eiv 'password|username|token|webbasepath|access url|dsn|credential|secret' |
+      sed -u 's/^/    | /' || true
+    [[ ! -s $WORK/xui-install.rc ]] ||
+      die "3x-ui 安装器失败(退出码 $(cat "$WORK/xui-install.rc");上面是它的输出,账号密码那几行已滤掉)"
     [[ -x $XUI_BIN ]] || die "3x-ui 没装上"
     fresh=1
   fi
