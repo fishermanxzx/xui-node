@@ -18,7 +18,7 @@
 - **BBR**：自动开启（拥塞控制 bbr，队列 fq），写进 `/etc/sysctl.d`，重启后保持。内核不支持（OpenVZ / LXC 这类容器）就跳过，不影响安装。
 - **防火墙**：用 nftables，只放行 SSH、80、节点端口（Reality 是 TCP 443，Hysteria2 是 UDP 443）、10001（SOCKS5）、2096，对所有 IP 开放，其余入站连接一律丢弃。建了 SOCKS5 入站时还会放行它的 UDP（见下面 [SOCKS5](#socks5)）。可以不启用。
 - **SSH 不是 22 端口也不用管**：会自动识别 SSH 端口（sshd 配置、实际监听的端口、ssh.socket、当前连接）。防火墙在安装的最后一步才生效；在终端里安装时，生效后会请你新开一个 SSH 窗口确认能登录，120 秒内不确认就自动撤销。
-- **不打印密码**：面板地址、账号密码、API token 和 SOCKS5 地址只写进 `/etc/xui-node/result.env`（只有 root 可读），安装过程中不会打印出来。3x-ui 安装器自己写的 `/etc/x-ui/install-result.env` 也保留，里面的端口和地址会改成装好后的值；它记的 token（名字叫 install）也保留，和 xui-node 的 token 一样能用。
+- **密码不进日志**：面板地址、账号密码、API token 和 SOCKS5 地址写进 `/etc/xui-node/result.env`（只有 root 可读），安装过程中间不会打印。在终端里一步一步装的，装完会在最后直接显示出来；带 `-y` 或不在终端里装（比如通过 ssh 批量装）时不显示，免得留在日志里，之后用 `xui-node info` 查看。3x-ui 安装器自己写的 `/etc/x-ui/install-result.env` 也保留，里面的端口和地址会改成装好后的值；它记的 token（名字叫 install）也保留，和 xui-node 的 token 一样能用。
 
 ## 准备
 
@@ -67,9 +67,13 @@ bash <(curl -fsSL https://raw.githubusercontent.com/fishermanxzx/xui-node/main/i
 
 ## 装好以后
 
+在终端里装的，最后一屏已经显示了面板地址、用户名、密码、API token（建了 SOCKS5 的话还有它的地址）。以后再看，或者是用 `-y` 装的：
+
 ```bash
 xui-node info     # 面板地址、用户名、密码、API token、SOCKS5 地址
 ```
+
+截图或发给别人前，先把密码和 token 打码。
 
 登录面板后，在节点入站（443 端口那个）里添加用户。如果要交给管理程序管理，就把 `PANEL_URL` 和 `PANEL_TOKEN` 给它。
 
@@ -111,7 +115,7 @@ xui-node socks            # 在 SOCKS 端口建 SOCKS5 入站，已有就沿用�
 xui-node socks --rotate   # 换一个新密码（用户名不变）
 ```
 
-- 地址是 `socks5://用户:密码@域名:端口` 格式，写在 `/etc/xui-node/result.env` 的 `SOCKS_URL`，用 `xui-node info` 查看，安装和这个命令都不会打印出来。
+- 地址是 `socks5://用户:密码@域名:端口` 格式，写在 `/etc/xui-node/result.env` 的 `SOCKS_URL`，用 `xui-node info` 查看；在终端里一步一步装的，装完最后一屏也会显示。`xui-node socks` 这个命令不会打印出来。
 - 换密码后，所有用旧地址连这个 SOCKS5 的地方都要改成新地址。
 - 端口上已经有 SOCKS 入站（比如自己在面板里建的）就沿用，账号密码不动，只把 UDP 设置补上（停用的会启用）；没设账号密码的不会直接沿用，要加 `--rotate` 给它设上。
 - 端口用安装时设的（默认 10001）；当时填了 0 的话，先执行 `xui-node install --socks-port 10001 --socks-inbound`。

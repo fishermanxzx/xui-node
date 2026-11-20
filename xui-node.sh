@@ -16,7 +16,7 @@
 set -Eeuo pipefail
 umask 022
 
-XUI_NODE_VERSION=1.4.2
+XUI_NODE_VERSION=1.5.0
 REPO=fishermanxzx/xui-node
 RAW_URL="https://raw.githubusercontent.com/${REPO}/${XUI_NODE_REF:-main}"
 
@@ -1677,7 +1677,15 @@ cmd_install() {
   FIREWALL=$(result_get FIREWALL)
   show_plan
   printf '\n'
-  if [[ $SOCKS_INBOUND == 1 ]]; then
+  if [[ $INTERACTIVE -eq 1 ]]; then
+    # 在终端里一步步装的,装完直接给看;-y 或不在终端里(ssh 批量装)不显示,免得留在调用方的日志里
+    info "面板信息如下(也保存在 $RESULT,只有 root 可读;以后用 xui-node info 再看)。截图或发给别人前,先把密码和 token 打码。"
+    (
+      load_result
+      show_info
+    )
+    printf '\n'
+  elif [[ $SOCKS_INBOUND == 1 ]]; then
     info "面板地址、登录账号、API token 和 SOCKS5 地址保存在 $RESULT(只有 root 可读,安装过程中没有打印)。"
   else
     info "面板地址、登录账号和 API token 保存在 $RESULT(只有 root 可读,安装过程中没有打印)。"
@@ -1717,6 +1725,11 @@ ensure_bin() {
 cmd_info() {
   need_root
   load_result
+  show_info
+}
+
+# 显示结果文件里的面板地址、账号密码、token(调用前先 load_result)
+show_info() {
   printf '\n'
   info "面板地址        ${PANEL_URL:-?}/"
   info "面板地址(IP)    ${PANEL_URL_IP:-?}/"
