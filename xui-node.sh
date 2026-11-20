@@ -16,7 +16,7 @@
 set -Eeuo pipefail
 umask 022
 
-XUI_NODE_VERSION=1.4.1
+XUI_NODE_VERSION=1.4.2
 REPO=fishermanxzx/xui-node
 RAW_URL="https://raw.githubusercontent.com/${REPO}/${XUI_NODE_REF:-main}"
 
@@ -902,7 +902,7 @@ acme_selfcheck() {
 }
 
 setup_site() {
-  local title nginx_ver listen_tls listen_v6 acct site_url site_80
+  local title nginx_ver listen_tls listen_v6 acct site_url site_80 i err=""
   step "Nginx 站点 + Let's Encrypt 证书"
   install -d -m 755 "$SITE_ROOT" "$ACME_ROOT"
   if [[ ! -f $SITE_ROOT/index.html ]]; then
@@ -1026,8 +1026,12 @@ EOF
   chmod 755 "$RENEW_HOOK"
   systemctl enable --now certbot.timer >/dev/null 2>&1 || true
   write_nginx
-  curl -fsS --max-time 10 --resolve "$DOMAIN:${SITE_PORT}:127.0.0.1" "https://$DOMAIN:${SITE_PORT}/" -o /dev/null ||
-    die "Nginx 127.0.0.1:${SITE_PORT} 没起来"
+  # 和上面的自查一样:reload 只发信号就返回,新加的 ${SITE_PORT} 要过一会儿才开始监听,多试几次
+  for ((i = 0; i < 15; i++)); do
+    err=$(curl -fsS --noproxy '*' --max-time 5 --resolve "$DOMAIN:${SITE_PORT}:127.0.0.1" "https://$DOMAIN:${SITE_PORT}/" -o /dev/null 2>&1) && break
+    sleep 1
+  done
+  [[ $i -lt 15 ]] || die "Nginx 127.0.0.1:${SITE_PORT} 没起来(${err:-没有报错信息})。排查:nginx -t; journalctl -u nginx -n 20 --no-pager"
   ok "证书已签好,站点在 127.0.0.1:${SITE_PORT}(自动续期)"
 }
 
