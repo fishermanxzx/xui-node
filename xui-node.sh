@@ -16,7 +16,7 @@
 set -Eeuo pipefail
 umask 022
 
-XUI_NODE_VERSION=1.2.0
+XUI_NODE_VERSION=1.2.1
 REPO=fishermanxzx/xui-node
 RAW_URL="https://raw.githubusercontent.com/${REPO}/${XUI_NODE_REF:-main}"
 
@@ -629,15 +629,21 @@ setup_bbr() {
 }
 
 # 申请证书前先自查:在验证目录放一个测试文件,本机用域名访问 80 端口读回来,读不回来就不去找 Let's Encrypt
-# (同一域名一小时内验证失败 5 次会被暂时拒绝)。本机访问不经过外网,查不出服务商安全组挡 80 或开了橙云
+# (同一域名一小时内验证失败 5 次会被暂时拒绝)。本机访问不经过外网,查不出服务商安全组挡 80 或开了橙云。
+# systemctl reload nginx 只发信号就返回,新配置要过一会儿才生效(刚装的 Nginx 还在用系统自带的 default 站点),
+# 所以多试几次
 acme_selfcheck() {
-  local dir=$ACME_ROOT/.well-known/acme-challenge name body got
+  local dir=$ACME_ROOT/.well-known/acme-challenge name body got="" i
   install -d -m 755 "$dir"
   name="xui-node-check-$(rand_hex 8)"
   body=$(rand_hex 16)
   printf '%s' "$body" >"$dir/$name"
   chmod 644 "$dir/$name"
-  got=$(curl -fsS --max-time 10 --resolve "$DOMAIN:80:127.0.0.1" "http://$DOMAIN/.well-known/acme-challenge/$name" 2>/dev/null || true)
+  for ((i = 0; i < 15; i++)); do
+    got=$(curl -fsS --noproxy '*' --max-time 5 --resolve "$DOMAIN:80:127.0.0.1" "http://$DOMAIN/.well-known/acme-challenge/$name" 2>/dev/null || true)
+    [[ $got != "$body" ]] || break
+    sleep 1
+  done
   rm -f "$dir/$name"
   [[ $got == "$body" ]] ||
     die "本机自查没通过:http://$DOMAIN/.well-known/acme-challenge/ 读不到测试文件(Nginx 80 端口没起来或配置不对),没去申请证书。排查:nginx -t; systemctl status nginx"
